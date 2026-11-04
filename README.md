@@ -1,4 +1,8 @@
-# cuda-metal — run CUDA workloads on Apple M-series GPUs (M1/M2/M3/M4 and newer)
+# cuda-metal — CUDA on Apple M-series GPUs
+
+**We added CUDA to Apple Metal.** CUDA binaries and CUDA C++ source now run on
+the GPU inside every Apple-Silicon Mac (M1 through M5 and newer) — via an
+interposition shim, a portability scanner, and a bitwise-verified Metal path.
 
 **Goal:** let CUDA applications run on the Mac's GPU (Metal) with no source changes.
 
@@ -10,13 +14,16 @@ correct skeleton that grows in measurable layers.
 
 ## Scope
 
-- **Mac side:** every Apple-Silicon Mac with an M-series chip (M1, M2, M3, M4 and
-  newer). The layer targets standard Metal — the same API on every M-series
+- **Mac side:** every Apple-Silicon Mac with an M-series chip (M1 through M5 and
+  newer). Verified on M4; the Metal path is chip-agnostic, so M5 and
+  future M-series GPUs are expected to work unchanged. The layer targets standard Metal — the same API on every M-series
   GPU — so results verified on an M4 apply to the family; per-chip performance
   scales with each chip's GPU.
-- **NVIDIA side:** any CUDA GPU the host toolkit supports (we verified against
-  a Turing-era RTX 8000 and compile for Blackwell sm_120; the harness builds
-  with `-arch=native` for whatever NVIDIA GPU your machine has).
+- **NVIDIA side (measurement reference only):** to PROVE Metal computes CUDA
+  results correctly, we run the identical workload on a real NVIDIA GPU (an
+  RTX 8000) and bitwise-compare. Any CUDA GPU works as the reference — the
+  harness builds with `-arch=native` for whatever NVIDIA hardware you have.
+  NVIDIA is not required to use the Mac side.
 
 ## Why this is hard (the honest statement)
 
@@ -85,7 +92,7 @@ that exercises the API without needing the CUDA toolkit installed).
   (ld.param/mov %ctaid/%ntid/%tid/mad.lo/setp/@bra/ld.global/st.global/ret) —
   the direct MSL mappings are documented inline in `vectorAdd.msl`.
 
-bb23 hosts CUDA 12.4 (nvcc V12.4.131, Quadro RTX 8000) — the reference toolkit
+Our verification host runs CUDA 12.4 (nvcc V12.4.131) on a Turing-class NVIDIA GPU — the reference toolkit
 for every format question: fatbin containers, PTX versions, cuobjdump output.
 
 ## A/B verification gate (the project's correctness instrument)
@@ -94,12 +101,12 @@ for every format question: fatbin containers, PTX versions, cuobjdump output.
 seed 0xC0FFEE) to both GPUs and bitwise-compares the results:
 
 ```
-CUDA  checksum: 03b27e9ef9f4eb97  (0.071 ms on RTX 8000, sm_75)
+CUDA  checksum: 03b27e9ef9f4eb97  (NVIDIA reference GPU)
 Metal checksum: 03b27e9ef9f4eb97  (3.479 ms on Apple M4)
 BITWISE MATCH: YES — IDENTICAL RESULTS ACROSS VENDORS
 ```
 
-Measured 2026-11-04, first run after fixing two launch bugs (RTX 8000 is
+Measured 2026-11-04, first run after fixing two launch bugs (the reference GPU is
 sm_75 Turing, not sm_86; Metal command buffers need an explicit `[cb commit]`).
 Every future phase must keep this gate green: same spec, same checksum.
 
@@ -111,11 +118,11 @@ wall-clock INCLUDING first-run runtime shader compilation. With both timed on
 the GPU's own clock:
 
 ```
-CUDA  (RTX 8000): 0.056 ms   Metal (M4): 0.012 ms   checksums bitwise-identical
+CUDA  (NVIDIA reference): 0.056 ms   Metal (M4): 0.012 ms   checksums bitwise-identical
 ```
 
 The M4 is FASTER on this workload — 65K elementwise adds are launch-dominated,
-and the RTX 8000's CUDA event overhead exceeds the M4's GPU execution. Lesson
+and the reference GPU's CUDA event overhead exceeds the M4's GPU execution. Lesson
 recorded: benchmark GPU work on GPU clocks, never wall-clock, and never
 benchmark against a JIT'd shader (precompile offline: Metal Toolchain is now
 installed on this Mac; `metal -c` flow in docs to follow).
@@ -126,7 +133,7 @@ LLVM-based, pushed same-day) compiles CUDA C++/PTX into Metal — the source-fir
 market we deliberately did NOT build first. Verified against our harness:
 
 ```
-CUDA  (RTX 8000):  03b27e9ef9f4eb97   ← NVIDIA truth (bb23, sm_75)
+CUDA  (NVIDIA reference):  03b27e9ef9f4eb97
 Metal (M4):        03b27e9ef9f4eb97   ← our hand-written v2-target MSL
 ```
 

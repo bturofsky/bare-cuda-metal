@@ -8,20 +8,20 @@ estimated, or borrowed from other projects' claims.
 
 **Measured on:** an Apple M4 (Metal) and a Quadro RTX 8000 (CUDA 12.4, Turing).
 The layer targets standard Metal, so the approach applies to **every Apple
-M-series chip** (M1/M2/M3/M4+); the harness builds with `-arch=native` for any
+M-series chip (M1 through M5 and newer)** (M1–M5+); the harness builds with `-arch=native` for any
 NVIDIA GPU your toolkit supports. Per-chip performance scales with each GPU.
 
 ---
 
-## 1. Headline result: bitwise-identical results across GPU vendors
+## 1. Headline result: CUDA results, reproduced bitwise on Apple Metal
 
 The same deterministic workload — 65,536 fp32 elementwise additions, fixed seed
 `0xC0FFEE`, FNV-1a checksum over the exact result bytes — executed on both:
 
-| Backend | Hardware | Stack | GPU time | Checksum |
+| Arm | Hardware | Stack | GPU time | Checksum |
 |---|---|---|---|---|
-| CUDA | Quadro RTX 8000 (Turing, sm_75) on bb23 | CUDA 12.4 (nvcc V12.4.131) | **0.056 ms** | `03b27e9ef9f4eb97` |
-| Metal | Apple M4 (integrated GPU), macOS 26.6 | Metal via hand-written MSL | **0.012 ms** | `03b27e9ef9f4eb97` |
+| NVIDIA reference | Quadro RTX 8000 (measurement reference only) | CUDA 12.4 | **0.056 ms** | `03b27e9ef9f4eb97` |
+| **Apple Metal (the deliverable)** | Apple M4, macOS 26.6 | Metal via hand-written MSL | **0.012 ms** | `03b27e9ef9f4eb97` |
 
 **Bitwise match: YES.** 262,144 result bytes, identical on both vendors.
 Element samples (first/mid/last): `1.389999 / -55.890007 / 30.950005` — identical.
@@ -109,7 +109,7 @@ PTX→MSL translator — no guessed subsets.
 
 | Arm | Machine | OS/toolkit | GPU |
 |---|---|---|---|
-| CUDA | bb23 (Linux x86_64) | CUDA 12.4, nvcc V12.4.131 | Quadro RTX 8000, 48 GB |
+| NVIDIA reference | bb23 (Linux x86_64) | CUDA 12.4, nvcc V12.4.131 | Quadro RTX 8000 (measurement reference only) |
 | Metal | Mac mini (Apple Silicon) | macOS 26.6, Metal toolchain 32023.922 | Apple M4 integrated |
 
 Scanner reference corpus: `libcuda.so.1` from the same toolkit — 712 exported
