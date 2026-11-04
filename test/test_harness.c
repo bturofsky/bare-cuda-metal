@@ -9,6 +9,7 @@
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef int (*fn_int_p)(int *);
 typedef int (*fn_void)(void);
@@ -46,9 +47,13 @@ int main(void) {
   cuDeviceGetName(name, sizeof name, 0);
   printf("device 0 -> %s\n", name);
 
-  int dptr = 0;
+  void *dptr = NULL;
   rc = cuMemAlloc(&dptr, 1024);
-  printf("memAlloc -> %d (fake dptr 0x%x)\n", rc, dptr);
+  printf("memAlloc -> %d (real host ptr %p)\n", rc, dptr);
+  // v1 contract: the allocation is REAL memory — write, read back, verify.
+  memset(dptr, 0xAB, 1024);
+  printf("deref test: %s\n", ((unsigned char *)dptr)[512] == 0xAB ? "WRITE/READ OK" : "FAIL");
+  memset(dptr, 0, 1024);
 
   static const unsigned char fatbin[64] = "P3 fatbin placeholder — v2 parses real containers";
   int module = 0;

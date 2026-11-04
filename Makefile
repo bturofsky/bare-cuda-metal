@@ -7,8 +7,8 @@ SHIM = shim/libcuda_shim.dylib
 
 all: $(SHIM) test_run scan/scan
 
-$(SHIM): shim/libcuda_shim.c shim/exports.txt
-	$(CC) $(CFLAGS) -o $@ shim/libcuda_shim.c
+$(SHIM): shim/libcuda_shim.m shim/exports.txt
+	$(CC) $(CFLAGS) -framework Metal -framework Foundation -o $@ shim/libcuda_shim.m
 
 test/test_harness: test/test_harness.c
 	$(CC) -O2 -Wall -o $@ test/test_harness.c
