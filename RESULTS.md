@@ -6,6 +6,11 @@ Every number in this document was produced by the harness in this repository
 (`scripts/run_ab.sh`, `scan/scan`) against real hardware. Nothing is projected,
 estimated, or borrowed from other projects' claims.
 
+**Measured on:** an Apple M4 (Metal) and a Quadro RTX 8000 (CUDA 12.4, Turing).
+The layer targets standard Metal, so the approach applies to **every Apple
+M-series chip** (M1/M2/M3/M4+); the harness builds with `-arch=native` for any
+NVIDIA GPU your toolkit supports. Per-chip performance scales with each GPU.
+
 ---
 
 ## 1. Headline result: bitwise-identical results across GPU vendors

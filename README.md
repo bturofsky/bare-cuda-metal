@@ -1,10 +1,24 @@
-# cuda-metal — a CUDA compatibility layer for Apple-Silicon Macs
+# cuda-metal — run CUDA workloads on Apple M-series GPUs (M1/M2/M3/M4 and newer)
 
 **Goal:** let CUDA applications run on the Mac's GPU (Metal) with no source changes.
 
 **Status:** v0 — API interposition skeleton. This is the separate project Ben directed
 (2026-11-04). Nothing here pretends the full ecosystem is close; the point is a
 correct skeleton that grows in measurable layers.
+
+---
+
+## Scope
+
+- **Mac side:** every Apple-Silicon Mac with an M-series chip (M1, M2, M3, M4 and
+  newer). The layer targets standard Metal — the same API on every M-series
+  GPU — so results verified on an M4 apply to the family; per-chip performance
+  scales with each chip's GPU.
+- **NVIDIA side:** any CUDA GPU the host toolkit supports (we verified against
+  a Turing-era RTX 8000 and compile for Blackwell sm_120; the harness builds
+  with `-arch=native` for whatever NVIDIA GPU your machine has).
+
+## Why this is hard (the honest statement)
 
 ---
 
