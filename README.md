@@ -176,10 +176,16 @@ firmware, or holds thermal loads. It is as safe as running any CUDA sample.
 | GPU | Compute | CUDA toolkit needed | A/B verified here |
 |---|---|---|---|
 | Quadro RTX 8000 | sm_75 | 11.0+ | **YES** (bitwise vs Metal) |
-| RTX PRO 6000 Blackwell | sm_120 | **12.8+** | compile-supported; **untested on hardware** — community results welcome (PR with your JSON output) |
+| RTX PRO 6000 Blackwell | sm_120 | **12.8+** | compile-VERIFIED on CUDA 13.0.1 (sm_120 binary builds clean); runtime untested on hardware — community results welcome (PR with your JSON output) |
 | Apple M4 (Metal) | — | macOS Metal | **YES** (bitwise vs CUDA) |
 | Other CUDA GPUs | sm_60+ | matching toolkit | should work via `-arch=native`; untested |
 
 Build for your machine: `cd cuda && ./build.sh` (CUDA 12.8+ embeds both sm_75
 and sm_120 cubins in one binary). Then run `./cuda_runner_multi` and send us
 the JSON line.
+
+**Distro note (Ubuntu 25.10/26.x, glibc ≥ 2.42):** CUDA 12.8/13 headers
+conflict with this glibc's `noexcept`-annotated `rsqrt` declarations. We patch
+`crt/math_functions.h` locally (add `noexcept(true)` to the 13 bare builtin
+declarations) and compile with `-arch=sm_120` cleanly under gcc 15. NVIDIA
+will presumably fix this in the next toolkit point release.
