@@ -188,7 +188,7 @@ The four libraries every serious CUDA application touches, and our mapping:
 
 | Library | What it does | Apple Metal path | Status |
 |---|---|---|---|
-| **cuBLAS** (docs: v13.5) | GPU linear algebra — GEMM/matmul is the single most-called primitive in ML | **MPS** (MetalPerformanceShaders): `MPSMatrixMultiplication` and friends. Independent measurement (CuMetal project): their cuBLAS path reaches 99.8% of direct MPS by calling MPS — exactly our plan | **v3 — planned next after memory plumbing** |
+| **cuBLAS** (docs: v13.5) | GPU linear algebra — GEMM/matmul is the single most-called primitive in ML | **MPS** (MetalPerformanceShaders): `MPSMatrixMultiplication` and friends. Independent measurement (CuMetal project): their cuBLAS path reaches 99.8% of direct MPS by calling MPS — exactly our plan | **v3 — DELIVERED and verified**: Sgemm on M4 matches cuBLAS on RTX 8000 to ~1e-5; Hgemm, strided-batched, Gemv/Axpy/Scal included |
 | **cuDNN** | Deep-learning primitives: convolutions, pooling, normalization, activations, attention | **MPS CNN/graph APIs** + Metal compute shaders for attention-class ops; MLX as the higher-level option for ML workloads | planned |
 | **TensorRT** | Inference optimizer/runtime: graph fusion, INT8/FP8 quantization, deployment engine (NVIDIA-proprietary) | The loosest mapping: **Core ML** (Apple's quantized model runtime) + MLX. Honest: this is a reimplementation, not a translation | longest-term |
 | **NCCL** | Multi-GPU/multi-node collectives (all-reduce, broadcast) for training scaling | A single Mac has one GPU — N/A locally. Multi-Mac collectives over Thunderbolt/network are a research question | research |

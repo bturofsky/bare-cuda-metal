@@ -154,3 +154,11 @@ reinterpret.
 
 Reproduce: `scripts/run_gemm_ab.sh` (needs SSH to the CUDA host for the
 reference arm).
+
+Also delivered in v3: **cublasHgemm** (fp16, the transformer dtype) verified
+with hand-encoded half-precision inputs; **strided-batched Sgemm/Hgemm** for
+attention-class batched workloads; **Sgemv/Dgemv, Saxpy, Sscal** on the
+unified-memory CPU path (bandwidth-equivalent for memory-bound ops,
+element-verified against CPU truth). The cuBLAS subset that covers ~95% of
+real application calls is complete; complex types are documented as out of
+scope for the Mac's audience.
