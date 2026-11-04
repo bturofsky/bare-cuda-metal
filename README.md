@@ -6,7 +6,7 @@ without rewriting them.
 
 The project runs a verified subset of the CUDA surface — today: cuBLAS GEMM (fp32),
 GEMV, AXPY, SCALE — verified **bitwise against NVIDIA CUDA running on an RTX
-8000**, with fp64-truth agreement to ~1e-5. See [verified results](RESULTS.md)
+8000**, with fp64-truth agreement to ~1e-5. See [verified results](VERIFIED.md) and the deep-dive record (RESULTS.md)
 for exactly what is implemented today, the full test record.
 
 ## Quick start
@@ -92,7 +92,7 @@ in 2 seconds.
 
 ## Documentation
 
-- [RESULTS.md](RESULTS.md) — the complete verified test record
+- [VERIFIED.md](VERIFIED.md) — the complete verified test record
 - [docs/reference/](docs/reference/) — libcuda symbol surface, real compiled
   PTX, and the hand-written MSL translation (the phase-2 acceptance test)
 
