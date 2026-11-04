@@ -162,3 +162,24 @@ scan of PyTorch's 1 GB libtorch_cuda.so (2 seconds, 2,758 kernels, zero PTX).
   derived from NVIDIA's SDK, and ships none of NVIDIA's headers, libraries,
   or compiler code. The CUDA symbols our shim exports are a published API
   interface, required for interoperability.
+
+## GPU safety
+
+The A/B workload is ordinary compute (elementwise fp32 add, 256 KB of buffers,
+sub-millisecond kernels). Server and workstation GPUs are engineered for
+sustained 24/7 compute with driver-managed thermal and power protections; our
+tests run for milliseconds. Nothing in this harness overclocks, modifies
+firmware, or holds thermal loads. It is as safe as running any CUDA sample.
+
+## GPU/toolkit support matrix
+
+| GPU | Compute | CUDA toolkit needed | A/B verified here |
+|---|---|---|---|
+| Quadro RTX 8000 | sm_75 | 11.0+ | **YES** (bitwise vs Metal) |
+| RTX PRO 6000 Blackwell | sm_120 | **12.8+** | compile-supported; **untested on hardware** — community results welcome (PR with your JSON output) |
+| Apple M4 (Metal) | — | macOS Metal | **YES** (bitwise vs CUDA) |
+| Other CUDA GPUs | sm_60+ | matching toolkit | should work via `-arch=native`; untested |
+
+Build for your machine: `cd cuda && ./build.sh` (CUDA 12.8+ embeds both sm_75
+and sm_120 cubins in one binary). Then run `./cuda_runner_multi` and send us
+the JSON line.

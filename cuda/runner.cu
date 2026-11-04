@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "spec.h"
 
 __global__ void vectorAdd(const float *a, const float *b, float *c, int n) {
@@ -14,6 +15,19 @@ __global__ void vectorAdd(const float *a, const float *b, float *c, int n) {
 int main(void) {
   static float a[SPEC_N], b[SPEC_N], c[SPEC_N];
   spec_fill(a, b);
+
+  // GPU identity: name + compute capability land in the JSON so community
+  // runs on any GPU (Turing sm_75 through Blackwell sm_120) are attributable.
+  cudaDeviceProp prop;
+  memset(&prop, 0, sizeof prop);
+  int dev = 0;
+  cudaGetDevice(&dev);
+  if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+    char backend[256];
+    snprintf(backend, sizeof backend, "cuda-%s-sm%d%d", prop.name,
+             prop.major, prop.minor);
+    setenv("SPEC_BACKEND_OVERRIDE", backend, 1);
+  }
 
   float *d_a, *d_b, *d_c;
   cudaMalloc(&d_a, SPEC_N * 4);
@@ -34,6 +48,10 @@ int main(void) {
   cudaEventElapsedTime(&gpu_ms, t0, t1);
 
   cudaMemcpy(c, d_c, SPEC_N * 4, cudaMemcpyDeviceToHost);
-  spec_json("cuda-rtx8000", spec_checksum(c), gpu_ms, c);
+  {
+    const char *override_name = getenv("SPEC_BACKEND_OVERRIDE");
+    if (override_name) spec_json(override_name, spec_checksum(c), gpu_ms, c);
+    else spec_json("cuda", spec_checksum(c), gpu_ms, c);
+  }
   return 0;
 }
