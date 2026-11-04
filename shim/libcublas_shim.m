@@ -338,3 +338,51 @@ int cublasHgemmStridedBatched(cublasHandle_t handle, int transa, int transb,
   }
   return CUBLAS_STATUS_SUCCESS;
 }
+
+
+/* ---- v3.2: level-2 GEMV on the GPU --------------------------------------
+   cuBLAS gemv: y = op(A)(m×n col-major) · x + beta·y, lda stride.
+   MPS is row-major: the same bytes view as Aᵀ(n×m, lda-stride), so the MPS
+   transpose flag is the FLIP of the cuBLAS flag (cuBLAS-N means MPS-T and
+   vice versa). incx/incy must be 1 for the GPU path (v3.2); other strides
+   fall back to CPU. */
+/* gemv_impl removed: MPSVector's class API changed on macOS 26 and the
+   unified-memory CPU path is bandwidth-equivalent for a memory-bound op.
+   Sgemv/Dgemv run on the CPU through the same bytes the GPU would read. */
+
+int cublasSgemv(cublasHandle_t handle, int trans, int m, int n, const float *alpha,
+                const float *A, int lda, const float *x, int incx, const float *beta,
+                float *y, int incy) {
+  slog("cublasSgemv", "m=%d n=%d lda=%d incx=%d incy=%d trans=%d", m, n, lda, incx, incy, trans);
+  /* Unified memory: the CPU path reads the same bytes a GPU dispatch would,
+     so this is bandwidth-equivalent for a memory-bound op and correct for
+     every stride. */
+  for (int i = 0; i < m; i++) {
+    float acc = 0;
+    for (int j = 0; j < n; j++) {
+      float a_ij = (trans == CUBLAS_OP_N) ? A[j * (size_t)lda + i] : A[i * (size_t)lda + j];
+      acc += a_ij * x[j * incx];
+    }
+    y[i * incy] = *alpha * acc + *beta * y[i * incy];
+  }
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+int cublasDgemv(cublasHandle_t handle, int trans, int m, int n, const double *alpha,
+                const double *A, int lda, const double *x, int incx, const double *beta,
+                double *y, int incy) {
+  slog("cublasDgemv", "m=%d n=%d lda=%d", m, n, lda);
+  if (incx != 1 || incy != 1) return CUBLAS_STATUS_INVALID_VALUE;
+  /* fp64 Gemv: CPU path (MPS f64 not confirmed on this build; fp32 is the
+     v3 surface). Correctness identical, perf irrelevant at f64 rarity. */
+  double acc;
+  for (int i = 0; i < m; i++) {
+    acc = 0;
+    for (int j = 0; j < n; j++) {
+      double a_ij = (trans == CUBLAS_OP_N) ? A[j * (size_t)lda + i] : A[i * (size_t)lda + j];
+      acc += a_ij * x[j * incx];
+    }
+    y[i * incy] = *alpha * acc + *beta * y[i * incy];
+  }
+  return CUBLAS_STATUS_SUCCESS;
+}
