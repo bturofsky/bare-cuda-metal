@@ -19,28 +19,20 @@
 #define MAX_PARAMS 16
 #define MAX_LINE 512
 
-/* Strip %, commas, brackets, semicolons from a PTX operand → clean MSL token */
-static void clean_tok(const char *tok, size_t toklen, char *out, size_t outsz) {
-  while (toklen > 0 && (isspace((unsigned char)*tok) || *tok == ',')) { tok++; toklen--; }
-  if (toklen > 0 && *tok == '%') { tok++; toklen--; }
-  if (toklen > 0 && *tok == '_') { tok++; toklen--; } /* strip leading _ from _param_N */
-  size_t k = 0;
-  for (size_t i = 0; i < toklen && k < outsz - 1; i++) {
-    unsigned char c = (unsigned char)tok[i];
-    if (isspace(c) || c == ';' || c == ']' || c == '[' || c == ',') break;
-    out[k++] = (isalnum(c) || c == '_') ? (char)c : '_';
-  }
-  out[k] = 0;
-  /* strip trailing _ that came from ; */
-  while (k > 0 && out[k-1] == '_') k--;
-  out[k] = 0;
-}
-
 /* Clean the mangled param name: Z9vectorAddPKfS0_Pfi_param_0 → param_0 */
 static void clean_param_name(const char *mangled, char *out, size_t outsz) {
   const char *pfx = strstr(mangled, "_param_");
   if (pfx) snprintf(out, outsz, "%s", pfx + 1);
   else snprintf(out, outsz, "%s", mangled);
+}
+
+/* Registers known to hold device pointers (ld.param.u64 / cvta chains) */
+static int is_ptr_reg(char regs[][32], int n, const char *r) {
+  for (int i = 0; i < n; i++) if (!strcmp(regs[i], r)) return 1;
+  return 0;
+}
+static void mark_ptr_reg(char regs[][32], int *n, const char *r) {
+  if (!is_ptr_reg(regs, *n, r) && *n < 64) snprintf(regs[(*n)++], 32, "%s", r);
 }
 
 int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
@@ -125,13 +117,21 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
   EMIT("kernel void %s_msl(\n", kernel_name);
   for (int i = 0; i < nkparams; i++) {
     if (kparams[i].is_ptr)
-      EMIT("  device const float *%s [[buffer(%d)]]%s\n",
+      /* Writable (no const): output params are stored to through these bindings */
+      EMIT("  device float *%s [[buffer(%d)]]%s\n",
            kparams[i].name, i, i + 1 < nkparams ? "," : "");
     else
       EMIT("  constant uint &%s [[buffer(%d)]]%s\n",
            kparams[i].name, i, i + 1 < nkparams ? "," : "");
   }
-  EMIT(", uint _tid [[thread_position_in_grid]]\n) {\n");
+  EMIT(",\n"
+       "  uint _gid [[threadgroup_position_in_grid]],\n"
+       "  uint _lid [[thread_position_in_threadgroup]],\n"
+       "  uint _lsz [[threads_per_threadgroup]]\n"
+       ") {\n");
+
+  char ptr_regs[64][32];
+  int nptr_regs = 0;
 
   /* Process the body: extract one instruction at a time, translate */
   char *ip = body;
@@ -154,11 +154,11 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
 
     ip = nl < func_end ? nl + 1 : func_end;
 
-    /* Skip empty, comments, declarations */
+    /* Skip empty, comments, declarations, closing brace.
+       Key on line start: strstr(".param") would also swallow ld.param ops. */
     if (!*ls) continue;
     if (*ls == '/' || strstr(ls, "//")) continue;
-    if (strstr(ls, ".visible") || strstr(ls, ".param") || strstr(ls, ".reg") ||
-        strstr(ls, ".maxntid") || strstr(ls, ".reqntid") || strstr(ls, "}"))
+    if (ls[0] == '.' || ls[0] == '}')
       continue;
 
     /* Skip labels like $L__BB0_2: */
@@ -187,27 +187,40 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
 
     const char *op = toks[0];
 
-    /* ld.param.u64 %rd1, [_Z9vectorAdd_param_0]; → the register holds the param ptr */
+    /* ld.param.u64 %rd1, [_param_0]; → register aliases the param pointer.
+       ld.param.u32 %r2, [_param_3]; → scalar param copy. */
     if (ntoks >= 2 && strstr(op, "ld.param")) {
-      /* Map this register to the param: emit as a pointer alias */
-      EMIT("  device const void *%s = %s;\n", toks[1], toks[2]);
-      continue;
-    }
-
-    /* mov.u32 %r3, %ctaid.x; → thread position */
-    if (ntoks >= 3 && !strcmp(op, "mov.u32")) {
-      if (strstr(toks[2], "ctaid") || strstr(toks[2], "ntid") || strstr(toks[2], "tid")) {
-        EMIT("  uint %s = _tid;\n", toks[1]);
-        continue;
+      char pname[64];
+      clean_param_name(toks[2], pname, sizeof pname);
+      if (strstr(op, ".u64")) {
+        EMIT("  device const void *%s = %s;\n", toks[1], pname);
+        mark_ptr_reg(ptr_regs, &nptr_regs, toks[1]);
+      } else {
+        EMIT("  uint %s = %s;\n", toks[1], pname);
       }
-      /* Plain mov */
-      EMIT("  uint %s = %s;\n", toks[1], toks[2]);
       continue;
     }
 
-    /* cvta.to.global — identity on unified memory */
+    /* mov.u32 %r3, %ctaid.x; → CUDA thread coordinates as MSL builtins */
+    if (ntoks >= 3 && !strcmp(op, "mov.u32")) {
+      if (strstr(toks[2], "ctaid"))
+        EMIT("  uint %s = _gid;\n", toks[1]);
+      else if (strstr(toks[2], "ntid"))
+        EMIT("  uint %s = _lsz;\n", toks[1]);
+      else if (strstr(toks[2], "tid"))
+        EMIT("  uint %s = _lid;\n", toks[1]);
+      else
+        EMIT("  uint %s = %s;\n", toks[1], toks[2]);
+      continue;
+    }
+
+    /* cvta.to.global — identity on unified memory, but the destination
+       register must still be defined (it feeds add.s64 chains) */
     if (strstr(op, "cvta.to.global")) {
-      /* No-op on unified memory */
+      if (ntoks >= 3) {
+        EMIT("  device const void *%s = %s;\n", toks[1], toks[2]);
+        mark_ptr_reg(ptr_regs, &nptr_regs, toks[1]);
+      }
       continue;
     }
 
@@ -250,16 +263,17 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
     }
 
     /* @%p1 bra LABEL; → conditional return (the bounds-check pattern) */
-    if (strstr(op, "@%p") && strstr(op, "bra")) {
-      const char *pred = toks[0];
-      if (pred[0] == '@') pred++;
-      EMIT("  if (%s) return;\n", pred);
+    if (ntoks >= 2 && !strcmp(toks[1], "bra")) {
+      EMIT("  if (%s) return;\n", toks[0]);
       continue;
     }
 
-    /* ld.global.f32 %f1, [%rd8+4]; → load from global memory.
-       The base register was aliased to a param pointer at ld.param time. */
+    /* ld.global.f32 %f1, [%rd8+4]; → device-space load. */
     if (strstr(op, "ld.global")) {
+      if (!strstr(op, ".f32")) { /* only f32 loads in the measured subset */
+        EMIT("  /* unsupported load: %s */\n", op);
+        continue;
+      }
       /* toks[1] = destination register
          toks[2] = address expression like rd8+4 or just rd8 */
       /* Find the base register name and the byte offset */
@@ -277,8 +291,8 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
         if (addr[k]) snprintf(offset_str, sizeof offset_str, "%s", addr + k);
       }
       /* The base register was aliased to the param pointer at ld.param time.
-         Emit the load: float f1 = *(float *)((char *)base_reg + offset); */
-      EMIT("  float %s = *(const float *)((const char *)%s + %s);\n",
+         Emit the load in device address space. */
+      EMIT("  float %s = *(device const float *)((device const char *)%s + %s);\n",
            toks[1], base_reg, offset_str);
       continue;
     }
@@ -298,7 +312,7 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
         if (addr[k]) snprintf(offset_str, sizeof offset_str, "%s", addr + k);
       }
       /* toks[2] = the source register/value */
-      EMIT("  *(float *)((char *)%s + %s) = %s;\n", base_reg, offset_str,
+      EMIT("  *(device float *)((device char *)%s + %s) = %s;\n", base_reg, offset_str,
            ntoks >= 3 ? toks[2] : "0");
       continue;
     }
@@ -321,15 +335,22 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
       continue;
     }
 
-    /* add.s64 / add.u64 */
+    /* add.s64 / add.u64 — pointer-aware: when an operand is a known device
+       pointer register, keep the sum in the device address space */
     if (strstr(op, "add.s64") || strstr(op, "add.u64")) {
-      if (ntoks >= 4) EMIT("  long %s = %s + %s;\n", toks[1], toks[2], toks[3]);
-      continue;
-    }
-
-    /* @%p bra LABEL; → conditional return (the bounds-check pattern) */
-    if (ntoks >= 2 && !strcmp(toks[1], "bra")) {
-      EMIT("  if (%s) return;\n", toks[0]);
+      if (ntoks >= 4) {
+        if (is_ptr_reg(ptr_regs, nptr_regs, toks[2])) {
+          EMIT("  device const char *%s = (device const char *)%s + (long)%s;\n",
+               toks[1], toks[2], toks[3]);
+          mark_ptr_reg(ptr_regs, &nptr_regs, toks[1]);
+        } else if (is_ptr_reg(ptr_regs, nptr_regs, toks[3])) {
+          EMIT("  device const char *%s = (device const char *)%s + (long)%s;\n",
+               toks[1], toks[3], toks[2]);
+          mark_ptr_reg(ptr_regs, &nptr_regs, toks[1]);
+        } else {
+          EMIT("  long %s = %s + %s;\n", toks[1], toks[2], toks[3]);
+        }
+      }
       continue;
     }
 

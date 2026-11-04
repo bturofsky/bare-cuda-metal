@@ -194,6 +194,19 @@ static char *extract_ptx(const void *data, size_t data_size, size_t *ptx_len) {
    that kernel's .entry, or NULL if not found. */
 char *cuda_metal_extract_ptx(const void *fatbin_data, size_t fatbin_size,
                              const char *kernel_name, size_t *ptx_len) {
+  /* Raw PTX input: cuModuleLoadData also accepts plain PTX text as the image */
+  if (fatbin_data && fatbin_size >= 16) {
+    size_t probe_len = fatbin_size < 4096 ? fatbin_size : 4096;
+    if (memcmp(fatbin_data, ".version", 8) == 0 ||
+        memmem(fatbin_data, probe_len, ".entry", 6)) {
+      char *result = malloc(fatbin_size + 1);
+      memcpy(result, fatbin_data, fatbin_size);
+      result[fatbin_size] = 0;
+      *ptx_len = fatbin_size;
+      return result;
+    }
+  }
+
   /* First extract all PTX from the fatbin */
   size_t total_ptx_len = 0;
   char *all_ptx = extract_ptx(fatbin_data, fatbin_size, &total_ptx_len);

@@ -22,6 +22,11 @@
 #include <time.h>
 #include <unistd.h>
 
+/* module_launch.m: fatbin/raw-PTX extraction + PTX→MSL translation */
+extern char *cuda_metal_extract_ptx(const void *fatbin_data, size_t fatbin_size,
+                                    const char *kernel_name, size_t *ptx_len);
+extern char *cuda_metal_translate(const char *ptx, size_t ptx_len, const char *kernel_name);
+
 enum {
   CUDA_SUCCESS = 0,
   CUDA_ERROR_NOT_INITIALIZED = 3,
@@ -257,35 +262,122 @@ float cuEventElapsedTime(CUdeviceptr start, CUdeviceptr end) {
   return 0.0f;
 }
 
-/* ---- module / kernel (the v2 frontier — honestly unsupported) ----------- */
+/* ---- module / kernel: v2 fatbin/raw-PTX → MSL → Metal dispatch ---------- */
+
+/* Module state: the image pointer stored at LoadData, the kernel name bound
+   at GetFunction. Parse + translate happen at launch time. One module / one
+   outstanding function — the measured-subset contract. */
+static const void *g_image_ptr = NULL;
+static size_t g_image_size = 0;
+static char g_kernel_name[128];
+
 int cuModuleLoad(CUdeviceptr *module, const char *fname) {
   slog("cuModuleLoad", "fname=%s", fname ? fname : "(null)");
   if (module) *module = 10;
   return CUDA_SUCCESS;
 }
 int cuModuleLoadData(CUdeviceptr *module, const void *image) {
-  slog("cuModuleLoadData", "image=%p — v2: fatbin parse + PTX->MSL", image);
-  if (module) *module = 10;
+  slog("cuModuleLoadData", "image=%p", image);
+  g_image_ptr = image;
+  g_image_size = 1 << 20; /* bounded scan; header validation gates deep reads */
+  if (module) *module = (CUdeviceptr)(uintptr_t)image;
   return CUDA_SUCCESS;
 }
 int cuModuleUnload(CUdeviceptr module) { slog("cuModuleUnload", ""); return CUDA_SUCCESS; }
 
 int cuModuleGetFunction(CUdeviceptr *func, CUdeviceptr module, const char *name) {
-  slog("cuModuleGetFunction", "module=%llu name=%s  << KERNEL NAME — the v2 worklist",
+  slog("cuModuleGetFunction", "module=%llu name=%s",
        (unsigned long long)module, name ? name : "(null)");
-  if (func) *func = 20;
+  if (name) snprintf(g_kernel_name, sizeof g_kernel_name, "%s", name);
+  if (func) *func = (CUdeviceptr)(uintptr_t)name;
   return CUDA_SUCCESS;
 }
 
 int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsigned bx,
                    unsigned by, unsigned bz, unsigned sharedMem, CUdeviceptr stream,
                    void **params, void **extra) {
-  slog("cuLaunchKernel",
-       "func=%llu grid=%ux%ux%u block=%ux%ux%u shared=%u stream=%llu params=%p  "
-       "<< v2: PTX->MSL translate + MTLComputePipeline dispatch",
-       (unsigned long long)func, gx, gy, gz, bx, by, bz, sharedMem,
-       (unsigned long long)stream, (void *)params);
-  return CUDA_ERROR_NOT_SUPPORTED;
+  slog("cuLaunchKernel", "grid=%ux%ux%u block=%ux%ux%u params=%p",
+       gx, gy, gz, bx, by, bz, (void *)params);
+
+  if (!g_device) return CUDA_ERROR_NOT_INITIALIZED;
+  if (!g_image_ptr || !g_kernel_name[0]) {
+    slog("cuLaunchKernel", "no module/function loaded");
+    return CUDA_ERROR_NOT_INITIALIZED;
+  }
+
+  /* 1. image → PTX → MSL */
+  size_t ptx_len = 0;
+  char *ptx = cuda_metal_extract_ptx(g_image_ptr, g_image_size, g_kernel_name, &ptx_len);
+  if (!ptx) {
+    slog("cuLaunchKernel", "no PTX found for %s in image", g_kernel_name);
+    return CUDA_ERROR_NOT_SUPPORTED;
+  }
+  char *msl = cuda_metal_translate(ptx, ptx_len, g_kernel_name);
+  free(ptx);
+  if (!msl) {
+    slog("cuLaunchKernel", "PTX→MSL translation failed for %s", g_kernel_name);
+    return CUDA_ERROR_NOT_SUPPORTED;
+  }
+
+  /* 2. compile MSL at launch time (v2: no caching yet — honest and slow) */
+  NSError *err = nil;
+  id<MTLLibrary> lib = [g_device newLibraryWithSource:@(msl) options:nil error:&err];
+  free(msl);
+  if (!lib) {
+    slog("cuLaunchKernel", "MSL compile failed: %s",
+         err.localizedDescription ? err.localizedDescription.UTF8String : "?");
+    return CUDA_ERROR_NOT_SUPPORTED;
+  }
+  NSString *fname = [NSString stringWithFormat:@"%s_msl", g_kernel_name];
+  id<MTLFunction> fn = [lib newFunctionWithName:fname];
+  if (!fn) {
+    slog("cuLaunchKernel", "function %s not in compiled library", fname.UTF8String);
+    return CUDA_ERROR_NOT_SUPPORTED;
+  }
+  id<MTLComputePipelineState> pso = [g_device newComputePipelineStateWithFunction:fn error:&err];
+  if (!pso) {
+    slog("cuLaunchKernel", "pipeline state failed: %s",
+         err.localizedDescription ? err.localizedDescription.UTF8String : "?");
+    return CUDA_ERROR_NOT_SUPPORTED;
+  }
+
+  /* 3. bind params: device pointers resolve through the allocation registry
+     to real MTLBuffers; anything else is a u32 scalar (measured subset).
+     params[i] points AT the i-th argument value. */
+  id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+  id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+  [enc setComputePipelineState:pso];
+  for (int bi = 0; params && params[bi] && bi < 16; bi++) {
+    id<MTLBuffer> b = buffer_for(*(void **)params[bi]);
+    if (b) {
+      [enc setBuffer:b offset:0 atIndex:bi];
+    } else {
+      uint32_t scalar = 0;
+      memcpy(&scalar, params[bi], sizeof scalar);
+      [enc setBytes:&scalar length:sizeof scalar atIndex:bi];
+    }
+  }
+
+  /* 4. dispatch: CUDA grid of blocks → 1-D Metal threadgroups */
+  NSUInteger nth = (NSUInteger)bx * by * bz;
+  if (nth == 0 || nth > pso.maxTotalThreadsPerThreadgroup) {
+    slog("cuLaunchKernel", "block %ux%ux%u exceeds device max %lu",
+         bx, by, bz, (unsigned long)pso.maxTotalThreadsPerThreadgroup);
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  NSUInteger ng = (NSUInteger)gx * gy * gz;
+  [enc dispatchThreadgroups:MTLSizeMake(ng, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+  [enc endEncoding];
+  [cb commit];
+  [cb waitUntilCompleted];
+
+  if (cb.status != MTLCommandBufferStatusCompleted) {
+    slog("cuLaunchKernel", "command buffer status %ld", (long)cb.status);
+    return CUDA_ERROR_NOT_SUPPORTED;
+  }
+  slog("cuLaunchKernel", "DISPATCHED OK on %s", g_device.name.UTF8String);
+  return CUDA_SUCCESS;
 }
 
 /* ---- runtime-API aliases ------------------------------------------------ */

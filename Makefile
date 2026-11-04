@@ -14,8 +14,8 @@ $(CUBLAS_SHIM): shim/libcublas_shim.m
 gemm_ab: test/gemm_ab.c $(CUBLAS_SHIM) $(SHIM)
 	$(CC) -O2 -Wall -o $@ test/gemm_ab.c
 
-$(SHIM): shim/libcuda_shim.m shim/exports.txt
-	$(CC) $(CFLAGS) -framework Metal -framework Foundation -o $@ shim/libcuda_shim.m
+$(SHIM): shim/libcuda_shim.m shim/module_launch.m translator/ptx2msl.c shim/exports.txt
+	$(CC) $(CFLAGS) -framework Metal -framework Foundation -o $@ shim/libcuda_shim.m shim/module_launch.m translator/ptx2msl.c -lz
 
 test/test_harness: test/test_harness.c
 	$(CC) -O2 -Wall -o $@ test/test_harness.c
