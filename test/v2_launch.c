@@ -6,8 +6,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef unsigned long long CUdeviceptr;
+
+static double now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
 
 int cuInit(unsigned int flags);
 int cuMemAlloc(CUdeviceptr *dptr, size_t bytes);
@@ -72,12 +79,14 @@ int main(void) {
   /* grid 4 blocks x 256 threads = 1024 threads, i = ctaid*ntid + tid */
   unsigned n = N;
   void *params[5] = { &da, &db, &dc, &n, NULL };
+
+  double t0 = now_ms();
   rc = cuLaunchKernel(func, 4, 1, 1, 256, 1, 1, 0, 0, params, NULL);
+  double t1 = now_ms();
   if (rc) { fprintf(stderr, "FAIL: cuLaunchKernel rc=%d\n", rc); return 1; }
   cuCtxSynchronize();
 
   cuMemcpyDtoH(hc, dc, N * sizeof(float));
-
   int bad = 0;
   for (int i = 0; i < N; i++) {
     float want = ha[i] + hb[i];
@@ -86,10 +95,32 @@ int main(void) {
       if (bad <= 3) fprintf(stderr, "mismatch @%d: got %f want %f\n", i, hc[i], want);
     }
   }
+
+  /* Second launch: same kernel, fresh data — exercises the pipeline cache
+     and proves buffers rebind correctly (not stale from launch 1). */
+  for (int i = 0; i < N; i++) { ha[i] = 3.0f * i + 1.0f; hb[i] = -2.0f * i; }
+  cuMemcpyHtoD(da, ha, N * sizeof(float));
+  cuMemcpyHtoD(db, hb, N * sizeof(float));
+  double t2 = now_ms();
+  rc = cuLaunchKernel(func, 4, 1, 1, 256, 1, 1, 0, 0, params, NULL);
+  double t3 = now_ms();
+  if (rc) { fprintf(stderr, "FAIL: cached cuLaunchKernel rc=%d\n", rc); return 1; }
+  cuCtxSynchronize();
+  cuMemcpyDtoH(hc, dc, N * sizeof(float));
+  for (int i = 0; i < N; i++) {
+    float want = ha[i] + hb[i];
+    if (hc[i] != want) {
+      bad++;
+      if (bad <= 6) fprintf(stderr, "cached mismatch @%d: got %f want %f\n", i, hc[i], want);
+    }
+  }
+
   if (bad == 0)
-    printf("V2 LAUNCH OK — %d/%d elements computed on the GPU match the CPU\n", N, N);
+    printf("V2 LAUNCH OK — 2x%d/%d GPU elements match CPU; "
+           "launch1 %.0f ms (compile+dispatch), launch2 %.3f ms (cached)\n",
+           N, N, t1 - t0, t3 - t2);
   else
-    printf("V2 LAUNCH FAILED — %d/%d mismatches\n", bad, N);
+    printf("V2 LAUNCH FAILED — %d mismatches across both launches\n", bad);
 
   cuMemFree(da); cuMemFree(db); cuMemFree(dc);
   free(ha); free(hb); free(hc); free(ptx);

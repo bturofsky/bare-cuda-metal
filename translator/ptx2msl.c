@@ -360,8 +360,11 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
       continue;
     }
 
-    /* Unknown instruction — skip with a comment */
-    EMIT("  /* unsupported: %s */\n", op);
+    /* Unknown instruction — hard fail. Skipping could silently change
+       semantics; the contract is "never a wrong translation". */
+    snprintf(err_buf, err_sz, "unsupported instruction '%s'", op);
+    free(text);
+    return -1;
   }
 
   EMIT("}\n");

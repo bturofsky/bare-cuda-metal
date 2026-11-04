@@ -271,6 +271,39 @@ static const void *g_image_ptr = NULL;
 static size_t g_image_size = 0;
 static char g_kernel_name[128];
 
+/* Launch-time MSL compile cache: (image, kernel name) → pipeline state.
+   The first launch pays the Metal frontend compile (~0.5s); later launches
+   reuse the cached state. */
+#define MAX_PSOS 16
+typedef struct {
+  char name[128];
+  const void *image;
+  id<MTLComputePipelineState> pso;
+} pso_rec;
+static pso_rec g_psos[MAX_PSOS];
+static int g_npsos = 0;
+static pthread_mutex_t g_pso_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static id<MTLComputePipelineState> cached_pso(const char *name, const void *image) {
+  pthread_mutex_lock(&g_pso_lock);
+  id<MTLComputePipelineState> p = nil;
+  for (int i = 0; i < g_npsos; i++)
+    if (g_psos[i].image == image && strcmp(g_psos[i].name, name) == 0) { p = g_psos[i].pso; break; }
+  pthread_mutex_unlock(&g_pso_lock);
+  return p;
+}
+
+static void cache_pso(const char *name, const void *image, id<MTLComputePipelineState> p) {
+  pthread_mutex_lock(&g_pso_lock);
+  if (g_npsos < MAX_PSOS) {
+    snprintf(g_psos[g_npsos].name, sizeof g_psos[g_npsos].name, "%s", name);
+    g_psos[g_npsos].image = image;
+    g_psos[g_npsos].pso = p;
+    g_npsos++;
+  }
+  pthread_mutex_unlock(&g_pso_lock);
+}
+
 int cuModuleLoad(CUdeviceptr *module, const char *fname) {
   slog("cuModuleLoad", "fname=%s", fname ? fname : "(null)");
   if (module) *module = 10;
@@ -319,27 +352,37 @@ int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsi
     return CUDA_ERROR_NOT_SUPPORTED;
   }
 
-  /* 2. compile MSL at launch time (v2: no caching yet — honest and slow) */
-  NSError *err = nil;
-  id<MTLLibrary> lib = [g_device newLibraryWithSource:@(msl) options:nil error:&err];
-  free(msl);
-  if (!lib) {
-    slog("cuLaunchKernel", "MSL compile failed: %s",
-         err.localizedDescription ? err.localizedDescription.UTF8String : "?");
-    return CUDA_ERROR_NOT_SUPPORTED;
-  }
-  NSString *fname = [NSString stringWithFormat:@"%s_msl", g_kernel_name];
-  id<MTLFunction> fn = [lib newFunctionWithName:fname];
-  if (!fn) {
-    slog("cuLaunchKernel", "function %s not in compiled library", fname.UTF8String);
-    return CUDA_ERROR_NOT_SUPPORTED;
-  }
-  id<MTLComputePipelineState> pso = [g_device newComputePipelineStateWithFunction:fn error:&err];
+  /* 2. pipeline state — cached per (image, kernel) after the first launch */
+  id<MTLComputePipelineState> pso = cached_pso(g_kernel_name, g_image_ptr);
   if (!pso) {
-    slog("cuLaunchKernel", "pipeline state failed: %s",
-         err.localizedDescription ? err.localizedDescription.UTF8String : "?");
-    return CUDA_ERROR_NOT_SUPPORTED;
+    NSError *err = nil;
+    id<MTLLibrary> lib = [g_device newLibraryWithSource:@(msl) options:nil error:&err];
+    if (!lib) {
+      slog("cuLaunchKernel", "MSL compile failed: %s",
+           err.localizedDescription ? err.localizedDescription.UTF8String : "?");
+      free(msl);
+      return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    NSString *fname = [NSString stringWithFormat:@"%s_msl", g_kernel_name];
+    id<MTLFunction> fn = [lib newFunctionWithName:fname];
+    if (!fn) {
+      slog("cuLaunchKernel", "function %s not in compiled library", fname.UTF8String);
+      free(msl);
+      return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    pso = [g_device newComputePipelineStateWithFunction:fn error:&err];
+    if (!pso) {
+      slog("cuLaunchKernel", "pipeline state failed: %s",
+           err.localizedDescription ? err.localizedDescription.UTF8String : "?");
+      free(msl);
+      return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    cache_pso(g_kernel_name, g_image_ptr, pso);
+    slog("cuLaunchKernel", "MSL compiled and cached");
+  } else {
+    slog("cuLaunchKernel", "pipeline cache hit");
   }
+  free(msl);
 
   /* 3. bind params: device pointers resolve through the allocation registry
      to real MTLBuffers; anything else is a u32 scalar (measured subset).
