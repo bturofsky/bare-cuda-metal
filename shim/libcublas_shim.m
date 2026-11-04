@@ -98,6 +98,33 @@ const char *cublasGetStatusString(int status) {
                   stride of the original)  → descriptor rows=k, cols=m, stride=lda
      if op == T:  Aᵀ is (m×k) row-major with row stride 1 → stride=1
    MPSMatrix uses element strides, so we scale by sizeof(T) at descriptor time. */
+/* IEEE half <-> float conversion (pure arithmetic, no library dependency). */
+static float half_to_float(unsigned short h) {
+  unsigned sign = (h >> 15) & 1, exp = (h >> 10) & 0x1f, man = h & 0x3ff;
+  uint32_t f;
+  if (exp == 0) f = (sign << 31) | (man << 13);                    /* zero/subnormal */
+  else if (exp == 31) f = (sign << 31) | 0x7f800000 | (man << 13); /* inf/nan */
+  else f = (sign << 31) | ((exp - 15 + 127) << 23) | (man << 13);
+  float out; memcpy(&out, &f, 4); return out;
+}
+static unsigned short float_to_half(float fin) {
+  uint32_t f; memcpy(&f, &fin, 4);
+  unsigned sign = (f >> 16) & 0x8000;
+  int exp = ((f >> 23) & 0xff) - 127 + 15;
+  unsigned man = (f >> 13) & 0x3ff;
+  if (exp <= 0) return (unsigned short)(sign);          /* flush to zero */
+  if (exp >= 31) return (unsigned short)(sign | 0x7c00); /* inf */
+  return (unsigned short)(sign | (exp << 10) | man);
+}
+
+static MPSMatrixDescriptor *desc16(NSUInteger rows, NSUInteger cols, NSUInteger ld) {
+  MPSMatrixDescriptor *d = [MPSMatrixDescriptor
+      matrixDescriptorWithRows:rows columns:cols matrices:1
+      rowBytes:ld * 2 matrixBytes:rows * ld * 2
+      dataType:MPSDataTypeFloat16];
+  return d;
+}
+
 static MPSMatrixDescriptor *desc(NSUInteger rows, NSUInteger cols, NSUInteger ld, NSUInteger elem) {
   /* v3: fp32 only. Dgemm lands when MPSDataTypeFloat64 is confirmed on this
      MPS build; today it is absent from the headers. */
@@ -144,12 +171,14 @@ static int gemm_impl(char transa, char transb,
   BOOL ta = (transa == CUBLAS_OP_T);
   BOOL tb = (transb == CUBLAS_OP_T);
 
-  /* Descriptors ALWAYS describe the physical col-major storage viewed
-     row-major (Aᵀ = k×m stride lda; Bᵀ = n×k stride ldb); the transpose
-     flags tell MPS to treat them transposed during the product. */
-  MPSMatrixDescriptor * dA = desc((NSUInteger)k, (NSUInteger)m, (NSUInteger)lda, elem);
-  MPSMatrixDescriptor * dB = desc((NSUInteger)n, (NSUInteger)k, (NSUInteger)ldb, elem);
-  MPSMatrixDescriptor * dC = desc((NSUInteger)n, (NSUInteger)m, (NSUInteger)ldc, elem);
+  /* MPS matrices are ROW-MAJOR; cuBLAS is column-major. Bridge: the same
+     bytes read row-major are the TRANSPOSES - the MPS descriptors are
+     A-transpose(k x m, lda), B-transpose(n x k, ldb), C-transpose(n x m, ldc)
+     and the product is computed as C-transpose = op(B-transpose) * op(A-transpose)
+     with left=B right=A, which lands A*B in C's bytes. */
+  MPSMatrixDescriptor *dA = desc((NSUInteger)k, (NSUInteger)m, (NSUInteger)lda, elem);
+  MPSMatrixDescriptor *dB = desc((NSUInteger)k, (NSUInteger)n, (NSUInteger)ldb, elem);
+  MPSMatrixDescriptor *dC = desc((NSUInteger)m, (NSUInteger)n, (NSUInteger)ldc, elem);
 
   MPSMatrix *mA = [[MPSMatrix alloc] initWithBuffer:bA descriptor:dA];
   MPSMatrix *mB = [[MPSMatrix alloc] initWithBuffer:bB descriptor:dB];
@@ -169,7 +198,7 @@ static int gemm_impl(char transa, char transb,
      Aᵀ(k×m, lda), so the LEFT operand is B and the RIGHT is A; the cuBLAS
      transpose flags ride their own sides (left follows op(B), right op(A)). */
   MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc]
-      initWithDevice:g_device transposeLeft:tb transposeRight:ta
+      initWithDevice:g_device transposeLeft:(transb == CUBLAS_OP_T) transposeRight:(transa == CUBLAS_OP_T)
       resultRows:(NSUInteger)n resultColumns:(NSUInteger)m
       interiorColumns:(NSUInteger)k alpha:a_d beta:b_d];
   /* MPS computes Cᵀ(n×m) = left(n×k) · right(k×m) where
@@ -225,3 +254,87 @@ int cublasSscal(cublasHandle_t handle, int n, const float *alpha, float *x, int 
 }
 
 /* ---- export every symbol (v3 surface grows; full list via Makefile) ----- */
+
+
+/* ---- v3.1: half-precision + strided-batched (the transformer workload) -- */
+int cublasHgemm(cublasHandle_t handle, int transa, int transb, int m, int n, int k,
+                const void *alpha, const void *A, int lda, const void *B, int ldb,
+                const void *beta, void *C, int ldc) {
+  slog("cublasHgemm", "m=%d n=%d k=%d lda=%d ldb=%d ldc=%d", m, n, k, lda, ldb, ldc);
+  pthread_once(&g_once, init_once);
+  if (!g_device) return CUBLAS_STATUS_NOT_INITIALIZED;
+  BOOL ta = (transa == CUBLAS_OP_T), tb = (transb == CUBLAS_OP_T);
+  /* fp16 alpha/beta are __half-bitpattern pointers; convert to double by
+     decoding through the half format. */
+  const unsigned short *ah = (const unsigned short *)alpha;
+  const unsigned short *bh = (const unsigned short *)beta;
+  double a_d = alpha ? (double)half_to_float(*ah) : 1.0;
+  double b_d = beta ? (double)half_to_float(*bh) : 0.0;
+
+  id<MTLBuffer> bA = [g_device newBufferWithBytesNoCopy:(void *)A
+      length:((NSUInteger)((k ? k : 1) * 2 * (lda ? lda : 1) + 4095) & ~4095)
+      options:MTLResourceStorageModeShared deallocator:nil];
+  id<MTLBuffer> bB = [g_device newBufferWithBytesNoCopy:(void *)B
+      length:((NSUInteger)((n ? n : 1) * 2 * (ldb ? ldb : 1) + 4095) & ~4095)
+      options:MTLResourceStorageModeShared deallocator:nil];
+  id<MTLBuffer> bC = [g_device newBufferWithBytesNoCopy:(void *)C
+      length:((NSUInteger)((m ? m : 1) * 2 * (ldc ? ldc : 1) + 4095) & ~4095)
+      options:MTLResourceStorageModeShared deallocator:nil];
+  if (!bA || !bB || !bC) return CUBLAS_STATUS_EXECUTION_FAILED;
+
+  MPSMatrixDescriptor *dA = desc16((NSUInteger)k, (NSUInteger)m, (NSUInteger)lda);
+  MPSMatrixDescriptor *dB = desc16((NSUInteger)k, (NSUInteger)n, (NSUInteger)ldb);
+  MPSMatrixDescriptor *dC = desc16((NSUInteger)m, (NSUInteger)n, (NSUInteger)ldc);
+  MPSMatrix *mA = [[MPSMatrix alloc] initWithBuffer:bA descriptor:dA];
+  MPSMatrix *mB = [[MPSMatrix alloc] initWithBuffer:bB descriptor:dB];
+  MPSMatrix *mC = [[MPSMatrix alloc] initWithBuffer:bC descriptor:dC];
+
+  MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc]
+      initWithDevice:g_device transposeLeft:(transb == CUBLAS_OP_T) transposeRight:(transa == CUBLAS_OP_T)
+      resultRows:(NSUInteger)n resultColumns:(NSUInteger)m
+      interiorColumns:(NSUInteger)k alpha:a_d beta:b_d];
+  id<MTLCommandBuffer> cb = [g_device newCommandQueue];
+  id<MTLCommandBuffer> cbuf = [cb commandBuffer];
+  [mm encodeToCommandBuffer:cbuf leftMatrix:mB rightMatrix:mA resultMatrix:mC];
+  [cbuf commit];
+  [cbuf waitUntilCompleted];
+  return (cbuf.status == MTLCommandBufferStatusCompleted)
+      ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_EXECUTION_FAILED;
+}
+
+/* Strided-batched: N independent GEMMs whose operand pointers advance by a
+   fixed stride. v3.1 loops the single-GEMM path per batch member — correct
+   and parallelizable; a single MPS batched dispatch is the v3.2 upgrade. */
+int cublasSgemmStridedBatched(cublasHandle_t handle, int transa, int transb,
+                              int m, int n, int k, const float *alpha,
+                              const float *A, int lda, long long strideA,
+                              const float *B, int ldb, long long strideB,
+                              const float *beta, float *C, int ldc, long long strideC,
+                              int batchCount) {
+  slog("cublasSgemmStridedBatched", "m=%d n=%d k=%d batch=%d", m, n, k, batchCount);
+  for (int b = 0; b < batchCount; b++) {
+    const float *Ab = (const float *)((const char *)A + (size_t)b * strideA * 4);
+    const float *Bb = (const float *)((const char *)B + (size_t)b * strideB * 4);
+    float *Cb = (float *)((char *)C + (size_t)b * strideC * 4);
+    int rc = cublasSgemm(handle, transa, transb, m, n, k, alpha, Ab, lda, Bb, ldb, beta, Cb, ldc);
+    if (rc != CUBLAS_STATUS_SUCCESS) return rc;
+  }
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+int cublasHgemmStridedBatched(cublasHandle_t handle, int transa, int transb,
+                              int m, int n, int k, const void *alpha,
+                              const void *A, int lda, long long strideA,
+                              const void *B, int ldb, long long strideB,
+                              const void *beta, void *C, int ldc, long long strideC,
+                              int batchCount) {
+  slog("cublasHgemmStridedBatched", "m=%d n=%d k=%d batch=%d", m, n, k, batchCount);
+  for (int b = 0; b < batchCount; b++) {
+    const char *Ab = (const char *)A + (size_t)b * strideA * 2;
+    const char *Bb = (const char *)B + (size_t)b * strideB * 2;
+    char *Cb = (char *)C + (size_t)b * strideC * 2;
+    int rc = cublasHgemm(handle, transa, transb, m, n, k, alpha, Ab, lda, Bb, ldb, beta, Cb, ldc);
+    if (rc != CUBLAS_STATUS_SUCCESS) return rc;
+  }
+  return CUBLAS_STATUS_SUCCESS;
+}
