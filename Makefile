@@ -5,7 +5,14 @@ CC = clang
 CFLAGS = -O2 -Wall -Wextra -dynamiclib
 SHIM = shim/libcuda_shim.dylib
 
-all: $(SHIM) test_run scan/scan
+all: $(SHIM) test_run scan/scan gemm_ab
+
+CUBLAS_SHIM = shim/libcublas_shim.dylib
+$(CUBLAS_SHIM): shim/libcublas_shim.m
+	$(CC) $(CFLAGS) -framework Metal -framework Foundation -framework MetalPerformanceShaders -o $@ shim/libcublas_shim.m
+
+gemm_ab: test/gemm_ab.c $(CUBLAS_SHIM) $(SHIM)
+	$(CC) -O2 -Wall -o $@ test/gemm_ab.c
 
 $(SHIM): shim/libcuda_shim.m shim/exports.txt
 	$(CC) $(CFLAGS) -framework Metal -framework Foundation -o $@ shim/libcuda_shim.m
