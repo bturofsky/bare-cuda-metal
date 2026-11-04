@@ -1,0 +1,36 @@
+// vectorAdd.msl — the v2 translation TARGET for docs/reference/vectorAdd.ptx
+//
+// This is what decomposeMaster… sorry — what the PTX→MSL translator must emit
+// for the canonical vectorAdd kernel. Every PTX construct in that file maps
+// here; this pair is the v2 acceptance test.
+//
+// PTX → MSL mapping exercised:
+//   .visible .entry name(.param …)        → kernel void name(device T* …, uint …)
+//   .param .u64 _param_0                  → device float*   (device pointer → device address space)
+//   .param .u32 _param_3                  → uint
+//   ld.param.u64 %rd1, [_param_0]         → (the parameter binding itself)
+//   mov.u32 %r3, %ctaid.x                 → threadgroup_position_in_grid.x
+//   mov.u32 %r4, %ntid.x                  → threads_per_threadgroup.x
+//   mov.u32 %r5, %tid.x                   → thread_position_in_threadgroup.x
+//   mad.lo.s32 %r1, %r3, %r4, %r5         → r1 = r3 * r4 + r5
+//   setp.ge.s32 %p1, %r1, %r2             → p1 = (r1 >= r2)
+//   @%p1 bra $L__BB0_2                    → if (p1) return;
+//   ld.global.f32 %f1, [%rd1+…]           → f1 = a[i]
+//   st.global.f32 [%rd3+…], %f1           → c[i] = f1
+//   ret                                   → (implicit)
+
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void vectorAdd(device const float* a  [[buffer(0)]],
+                      device const float* b  [[buffer(1)]],
+                      device float*       c  [[buffer(2)]],
+                      constant uint&      n  [[buffer(3)]],
+                      uint3 tid [[thread_position_in_threadgroup]],
+                      uint3 bid [[threadgroup_position_in_grid]],
+                      uint3 bdim [[threads_per_threadgroup]])
+{
+    uint r1 = bid.x * bdim.x + tid.x;   // mad.lo.s32 %r1, %r3, %r4, %r5
+    if (r1 >= n) return;                 // setp.ge.s32 + @%p1 bra
+    c[r1] = a[r1] + b[r1];               // ld.global.f32 ×2, add.f32, st.global.f32
+}

@@ -1,0 +1,14 @@
+#include <metal_stdlib>
+using namespace metal;
+kernel void vectorAdd(device const float* a [[buffer(0)]],
+                      device const float* b [[buffer(1)]],
+                      device float*       c [[buffer(2)]],
+                      constant uint&      n [[buffer(3)]],
+                      uint3 tid [[thread_position_in_threadgroup]],
+                      uint3 bid [[threadgroup_position_in_grid]],
+                      uint3 bdim [[threads_per_threadgroup]])
+{
+    uint r1 = bid.x * bdim.x + tid.x;
+    if (r1 >= n) return;
+    c[r1] = a[r1] + b[r1];
+}
