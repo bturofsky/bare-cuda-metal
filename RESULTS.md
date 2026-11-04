@@ -132,3 +132,25 @@ driver functions recorded in `docs/reference/libcuda_driver_symbols.txt`.
 **Reproduce:** `make && make test_run` (shim), `./scripts/run_ab.sh` (the A/B
 gate; needs SSH access to the CUDA host), `make scan/scan && ./scan/scan
 <binary>` (the portability profile).
+
+## 6.5 cuBLAS port (v3): Sgemm on Apple M4 via MPS — verified
+
+With v1 memory plumbing live (real shared-storage MTLBuffers; unified memory
+device pointer == host pointer) the shim exposes the cuBLAS surface and maps
+`cublasSgemm` onto MPS. 512×512×512 fp32 GEMM, same deterministic inputs:
+
+| Arm | Hardware/stack | c[0] | c[last] |
+|---|---|---|---|
+| cuBLAS (truth) | RTX 8000, CUDA 12.4 | 20.544796 | -6.563200 |
+| **Shim cuBLAS→MPS** | Apple M4, this project | **20.544806** | **-6.563198** |
+| fp64 CPU reference | numpy, float64 | 20.544800 | -6.563200 |
+
+Agreement ~1e-5 relative. Bugs found and fixed on the way (each isolated by
+the harness): MPS renamed its descriptor constructor on macOS 26 (runtime
+selector probe); operand order must be left=B/right=A for col-major cuBLAS on
+row-major MPS; and reading cuBLAS's float alpha/beta reinterpreted as double
+produces ≈0 and silently zeroes the result — convert by width, never by
+reinterpret.
+
+Reproduce: `scripts/run_gemm_ab.sh` (needs SSH to the CUDA host for the
+reference arm).
