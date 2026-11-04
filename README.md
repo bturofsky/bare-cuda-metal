@@ -6,7 +6,7 @@ interposition shim, a portability scanner, and a bitwise-verified Metal path.
 
 **Goal:** let CUDA applications run on the Mac's GPU (Metal) with no source changes.
 
-**Status:** v0.1 — API interposition. We are close to full CUDA compatibility — we will be adding additional parts of the ecosystem (cuBLAS, cuDNN, TensorRT, NCCL). The approach is to build a correct foundation and expand it in verified stages, with each stage gated by the bitwise A/B test in RESULTS.md.
+**Status:** v0.1 — API interposition. We are close to full CUDA compatibility — we will be adding additional parts to the ecosystem (cuBLAS, cuDNN, TensorRT, NCCL), which is enormous. Our approach is to build a correct foundation and expand it in verified stages, with each stage gated by the bitwise A/B test in RESULTS.md.
 
 ---
 
