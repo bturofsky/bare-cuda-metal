@@ -6,9 +6,7 @@ interposition shim, a portability scanner, and a bitwise-verified Metal path.
 
 **Goal:** let CUDA applications run on the Mac's GPU (Metal) with no source changes.
 
-**Status:** v0 — API interposition skeleton. This is the separate project Ben directed
-(2026-11-04). Nothing here pretends the full ecosystem is close; the point is a
-correct skeleton that grows in measurable layers.
+**Status:** v0.1 — API interposition skeleton. Nothing here pretends the full ecosystem is close; the point is a correct skeleton that grows in measurable layers.
 
 ---
 
