@@ -29,6 +29,8 @@ extern char *cuda_metal_translate(const char *ptx, size_t ptx_len, const char *k
 extern int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
                                 const char *kernel_name, char *msl_buf,
                                 size_t msl_buf_sz, char *err_buf, size_t err_sz);
+extern int ptx_param_types(const char *mangled, const char *ptx_text, size_t ptx_len,
+                           char *types, int max_types);
 
 enum {
   CUDA_SUCCESS = 0,
@@ -267,41 +269,61 @@ float cuEventElapsedTime(CUdeviceptr start, CUdeviceptr end) {
 
 /* ---- module / kernel: v2 fatbin/raw-PTX → MSL → Metal dispatch ---------- */
 
-/* Module state: the image pointer stored at LoadData, the kernel name bound
-   at GetFunction. Parse + translate happen at launch time. One module / one
-   outstanding function — the measured-subset contract. */
-static const void *g_image_ptr = NULL;
-static size_t g_image_size = 0;
-static char g_kernel_name[128];
+/* Module and function tables: a module holds its image pointer; a function
+   handle (index+1) binds one kernel name to one module. */
+#define MAX_MODULES 8
+#define MAX_FUNCS 32
+typedef struct { const void *image; size_t size; } mod_rec;
+static mod_rec g_mods[MAX_MODULES];
+static int g_nmods = 0;
+typedef struct { int mod; char name[128]; } func_rec;
+static func_rec g_funcs[MAX_FUNCS];
+static int g_nfuncs = 0;
 
-/* Launch-time MSL compile cache: (image, kernel name) → pipeline state.
-   The first launch pays the Metal frontend compile (~0.5s); later launches
-   reuse the cached state. */
+/* Launch-time MSL compile cache: (image, kernel name) → pipeline state +
+   the decoded param types used for binding. The first launch pays the
+   Metal frontend compile (~0.5s); later launches reuse the cached state. */
 #define MAX_PSOS 16
+#define MAX_PTYPES 16
 typedef struct {
   char name[128];
   const void *image;
   id<MTLComputePipelineState> pso;
+  char ptypes[MAX_PTYPES];
+  int nptypes;
 } pso_rec;
 static pso_rec g_psos[MAX_PSOS];
 static int g_npsos = 0;
 static pthread_mutex_t g_pso_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static id<MTLComputePipelineState> cached_pso(const char *name, const void *image) {
+static id<MTLComputePipelineState> cached_pso(const char *name, const void *image,
+                                              char *types_out, int *n_out) {
   pthread_mutex_lock(&g_pso_lock);
   id<MTLComputePipelineState> p = nil;
   for (int i = 0; i < g_npsos; i++)
-    if (g_psos[i].image == image && strcmp(g_psos[i].name, name) == 0) { p = g_psos[i].pso; break; }
+    if (g_psos[i].image == image && strcmp(g_psos[i].name, name) == 0) {
+      p = g_psos[i].pso;
+      if (types_out && n_out) {
+        memcpy(types_out, g_psos[i].ptypes, (size_t)g_psos[i].nptypes);
+        *n_out = g_psos[i].nptypes;
+      }
+      break;
+    }
   pthread_mutex_unlock(&g_pso_lock);
   return p;
 }
 
-static void cache_pso(const char *name, const void *image, id<MTLComputePipelineState> p) {
+static void cache_pso(const char *name, const void *image, id<MTLComputePipelineState> p,
+                      const char *types, int ntypes) {
   pthread_mutex_lock(&g_pso_lock);
   if (g_npsos < MAX_PSOS) {
     snprintf(g_psos[g_npsos].name, sizeof g_psos[g_npsos].name, "%s", name);
     g_psos[g_npsos].image = image;
     g_psos[g_npsos].pso = p;
+    if (types && ntypes > 0) {
+      memcpy(g_psos[g_npsos].ptypes, types, (size_t)ntypes);
+      g_psos[g_npsos].nptypes = ntypes;
+    }
     g_npsos++;
   }
   pthread_mutex_unlock(&g_pso_lock);
@@ -314,52 +336,81 @@ int cuModuleLoad(CUdeviceptr *module, const char *fname) {
 }
 int cuModuleLoadData(CUdeviceptr *module, const void *image) {
   slog("cuModuleLoadData", "image=%p", image);
-  g_image_ptr = image;
-  g_image_size = 1 << 20; /* bounded scan; header validation gates deep reads */
-  if (module) *module = (CUdeviceptr)(uintptr_t)image;
+  int mi = -1;
+  for (int i = 0; i < g_nmods; i++)
+    if (g_mods[i].image == image) { mi = i; break; }
+  if (mi < 0) {
+    if (g_nmods >= MAX_MODULES) {
+      slog("cuModuleLoadData", "module table full");
+      return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    g_mods[g_nmods].image = image;
+    g_mods[g_nmods].size = 1 << 20; /* bounded scan; header validation gates deep reads */
+    mi = g_nmods++;
+  }
+  if (module) *module = (CUdeviceptr)(mi + 1); /* handle: index+1, 0 invalid */
   return CUDA_SUCCESS;
 }
 int cuModuleUnload(CUdeviceptr module) { slog("cuModuleUnload", ""); return CUDA_SUCCESS; }
 
 int cuModuleGetFunction(CUdeviceptr *func, CUdeviceptr module, const char *name) {
-  slog("cuModuleGetFunction", "module=%llu name=%s",
-       (unsigned long long)module, name ? name : "(null)");
-  if (name) snprintf(g_kernel_name, sizeof g_kernel_name, "%s", name);
-  if (func) *func = (CUdeviceptr)(uintptr_t)name;
+  int mi = (int)module - 1;
+  slog("cuModuleGetFunction", "module=%d name=%s", mi, name ? name : "(null)");
+  if (mi < 0 || mi >= g_nmods) return CUDA_ERROR_INVALID_VALUE;
+  if (!name || !name[0]) return CUDA_ERROR_INVALID_VALUE;
+  if (g_nfuncs >= MAX_FUNCS) {
+    slog("cuModuleGetFunction", "function table full");
+    return CUDA_ERROR_OUT_OF_MEMORY;
+  }
+  g_funcs[g_nfuncs].mod = mi;
+  snprintf(g_funcs[g_nfuncs].name, sizeof g_funcs[g_nfuncs].name, "%s", name);
+  if (func) *func = (CUdeviceptr)(g_nfuncs + 1);
+  g_nfuncs++;
   return CUDA_SUCCESS;
 }
 
 int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsigned bx,
                    unsigned by, unsigned bz, unsigned sharedMem, CUdeviceptr stream,
                    void **params, void **extra) {
-  slog("cuLaunchKernel", "grid=%ux%ux%u block=%ux%ux%u params=%p",
-       gx, gy, gz, bx, by, bz, (void *)params);
-
+  int fidx = (int)func - 1;
   if (!g_device) return CUDA_ERROR_NOT_INITIALIZED;
-  if (!g_image_ptr || !g_kernel_name[0]) {
-    slog("cuLaunchKernel", "no module/function loaded");
-    return CUDA_ERROR_NOT_INITIALIZED;
+  if (fidx < 0 || fidx >= g_nfuncs) {
+    slog("cuLaunchKernel", "invalid function handle %llu", (unsigned long long)func);
+    return CUDA_ERROR_INVALID_VALUE;
   }
+  int mi = g_funcs[fidx].mod;
+  const void *image = g_mods[mi].image;
+  size_t image_size = g_mods[mi].size;
+  const char *kname = g_funcs[fidx].name;
+  slog("cuLaunchKernel", "%s grid=%ux%ux%u block=%ux%ux%u params=%p",
+       kname, gx, gy, gz, bx, by, bz, (void *)params);
 
   /* 1. pipeline state — cached per (image, kernel); extract+translate only
      on a miss so cached launches skip the PTX work entirely */
-  id<MTLComputePipelineState> pso = cached_pso(g_kernel_name, g_image_ptr);
+  char ptypes[MAX_PTYPES];
+  int nptypes = 0;
+  id<MTLComputePipelineState> pso = cached_pso(kname, image, ptypes, &nptypes);
   if (!pso) {
     size_t ptx_len = 0;
-    char *ptx = cuda_metal_extract_ptx(g_image_ptr, g_image_size, g_kernel_name, &ptx_len);
+    char *ptx = cuda_metal_extract_ptx(image, image_size, kname, &ptx_len);
     if (!ptx) {
-      slog("cuLaunchKernel", "no PTX found for %s in image", g_kernel_name);
+      slog("cuLaunchKernel", "no PTX found for %s in image", kname);
       return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    nptypes = ptx_param_types(kname, ptx, ptx_len, ptypes, MAX_PTYPES);
+    if (nptypes <= 0) {
+      nptypes = 0;
+      slog("cuLaunchKernel", "param types unavailable — heuristic binding");
     }
     /* translate directly so the translator's error reaches the log */
     char terr[256] = "";
     char *msl = malloc(16384);
-    int trc = translate_ptx_kernel(ptx, ptx_len, g_kernel_name, msl, 16384,
+    int trc = translate_ptx_kernel(ptx, ptx_len, kname, msl, 16384,
                                    terr, sizeof terr);
     free(ptx);
     if (trc != 0) {
       slog("cuLaunchKernel", "PTX→MSL translation failed for %s: %s",
-           g_kernel_name, terr[0] ? terr : "unknown");
+           kname, terr[0] ? terr : "unknown");
       free(msl);
       return CUDA_ERROR_NOT_SUPPORTED;
     }
@@ -372,7 +423,7 @@ int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsi
       free(msl);
       return CUDA_ERROR_NOT_SUPPORTED;
     }
-    NSString *fname = [NSString stringWithFormat:@"%s_msl", g_kernel_name];
+    NSString *fname = [NSString stringWithFormat:@"%s_msl", kname];
     id<MTLFunction> fn = [lib newFunctionWithName:fname];
     if (!fn) {
       slog("cuLaunchKernel", "function %s not in compiled library", fname.UTF8String);
@@ -386,23 +437,34 @@ int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsi
       free(msl);
       return CUDA_ERROR_NOT_SUPPORTED;
     }
-    cache_pso(g_kernel_name, g_image_ptr, pso);
+    cache_pso(kname, image, pso, ptypes, nptypes);
     slog("cuLaunchKernel", "MSL compiled and cached");
     free(msl);
   } else {
     slog("cuLaunchKernel", "pipeline cache hit");
   }
 
-  /* 3. bind params: device pointers resolve through the allocation registry
-     to real MTLBuffers; anything else is a u32 scalar (measured subset).
-     params[i] points AT the i-th argument value. */
+  /* 3. bind params: types come from the mangled name (exact) or the PTX
+     .param list (u64 ambiguous). 'p': registry lookup → real MTLBuffer,
+     else the raw 8 bytes. 'l'/'d': 8-byte scalar. 'u'/'i'/'f': exactly 4
+     bytes (never reads past a 4-byte argument slot). */
   id<MTLCommandBuffer> cb = [g_queue commandBuffer];
   id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
   [enc setComputePipelineState:pso];
   for (int bi = 0; params && params[bi] && bi < 16; bi++) {
-    id<MTLBuffer> b = buffer_for(*(void **)params[bi]);
-    if (b) {
-      [enc setBuffer:b offset:0 atIndex:bi];
+    char t = bi < nptypes ? ptypes[bi] : '?';
+    if (t == 'p' || t == '?') {
+      void *val = *(void **)params[bi];
+      id<MTLBuffer> b = buffer_for(val);
+      if (b) {
+        [enc setBuffer:b offset:0 atIndex:bi];
+      } else {
+        /* pointer outside the registry: bind the 8 raw bytes (unified
+           memory makes the host pointer a usable device address) */
+        [enc setBytes:params[bi] length:8 atIndex:bi];
+      }
+    } else if (t == 'l' || t == 'd') {
+      [enc setBytes:params[bi] length:8 atIndex:bi];
     } else {
       uint32_t scalar = 0;
       memcpy(&scalar, params[bi], sizeof scalar);

@@ -35,6 +35,142 @@ static void mark_ptr_reg(char regs[][32], int *n, const char *r) {
   if (!is_ptr_reg(regs, *n, r) && *n < 64) snprintf(regs[(*n)++], 32, "%s", r);
 }
 
+/* ---- param type decoding for launch-time binding ------------------------ */
+
+/* The PTX .param list cannot distinguish a .u64 device pointer from a .u64
+   scalar — but the kernel's Itanium mangled name can. Decode it; fall back
+   to the PTX types when the name is not a decodable mangle. */
+
+static char classify_type(const char *t) {
+  if (strchr(t, 'P')) return 'p';
+  char c = t[strlen(t) - 1];
+  switch (c) {
+    case 'f': return 'f';
+    case 'd': case 'e': return 'd'; /* double, long double */
+    case 'l': case 'm': return 'l'; /* long, unsigned long/size_t */
+    case 'i': case 'j': case 's': case 't': case 'c': case 'a':
+    case 'h': case 'b': case 'w': return 'u';
+    default: return '?';
+  }
+}
+
+/* Parse one mangled type; appends completed composites to the substitution
+   table per Itanium rules (substitutions and builtins do not join it). */
+static int mangle_type(const char **pp, char table[][24], int *nt,
+                       char *out, size_t outsz) {
+  const char *p = *pp;
+  if (!*p) return -1;
+  if (*p == 'K' || *p == 'V' || *p == 'r') {
+    (*pp)++;
+    char inner[24];
+    if (mangle_type(pp, table, nt, inner, sizeof inner) < 0) return -1;
+    snprintf(out, outsz, "%c%s", *p == 'r' ? 'K' : *p, inner);
+    if (*nt < 32) snprintf(table[(*nt)++], 24, "%s", out);
+    return 0;
+  }
+  if (*p == 'P') {
+    (*pp)++;
+    char inner[24];
+    if (mangle_type(pp, table, nt, inner, sizeof inner) < 0) return -1;
+    snprintf(out, outsz, "P%s", inner);
+    if (*nt < 32) snprintf(table[(*nt)++], 24, "%s", out);
+    return 0;
+  }
+  if (*p == 'S') {
+    const char *q = p + 1;
+    long idx;
+    if (*q == '_') { idx = 0; q++; }
+    else if (isalnum((unsigned char)*q)) {
+      idx = strtoul(q, (char **)&q, 36) + 1;
+      if (*q != '_') return -1;
+      q++;
+    } else return -1;
+    if (idx < 0 || idx >= *nt) return -1;
+    snprintf(out, outsz, "%s", table[idx]);
+    *pp = q;
+    return 0;
+  }
+  if (strchr("fvailjbmbscth", *p)) {
+    snprintf(out, outsz, "%c", *p);
+    (*pp)++;
+    return 0;
+  }
+  return -1; /* templates, arrays, names: unsupported */
+}
+
+/* Fill types[] with per-param class chars ('p','u','i','f','d','l').
+   Returns the param count, or -1 if the kernel cannot be classified. */
+int ptx_param_types(const char *mangled, const char *ptx_text, size_t ptx_len,
+                    char *types, int max_types) {
+  /* Count the PTX .param decls for cross-checking */
+  int ptx_count = 0;
+  if (ptx_text && ptx_len) {
+    char *text = malloc(ptx_len + 1);
+    if (text) {
+      memcpy(text, ptx_text, ptx_len);
+      text[ptx_len] = 0;
+      char *p = text;
+      while ((p = strstr(p, ".param"))) { ptx_count++; p += 6; }
+      free(text);
+    }
+  }
+
+  /* 1. mangled-name decode */
+  int n = 0;
+  if (mangled && strncmp(mangled, "_Z", 2) == 0) {
+    const char *p = mangled + 2;
+    if (isdigit((unsigned char)*p)) { /* skip <length><name> */
+      char *e;
+      long len = strtol(p, &e, 10);
+      p = e + (len > 0 ? len : 0);
+      char table[32][24];
+      int nt = 0;
+      while (*p && n < max_types) {
+        char tstr[24];
+        if (mangle_type(&p, table, &nt, tstr, sizeof tstr) < 0) { n = -1; break; }
+        char cls = classify_type(tstr);
+        if (cls == '?') { n = -1; break; }
+        types[n++] = cls;
+      }
+      if (n >= 0 && *p) n = -1; /* trailing garbage: not a pure param mangle */
+    } else n = -1;
+  } else n = -1;
+
+  /* 2. accept only when the count matches the PTX signature */
+  if (n > 0 && (ptx_count == 0 || n == ptx_count)) return n;
+
+  /* 3. fallback: PTX .param types (u64 ambiguous → treated as pointer;
+     the shim's registry miss still yields an 8-byte scalar bind) */
+  n = 0;
+  if (ptx_text && ptx_len) {
+    char *text = malloc(ptx_len + 1);
+    if (!text) return -1;
+    memcpy(text, ptx_text, ptx_len);
+    text[ptx_len] = 0;
+    char *p = text;
+    while ((p = strstr(p, ".param")) && n < max_types) {
+      p += 6;
+      while (*p && isspace((unsigned char)*p)) p++;
+      char t[16] = "";
+      int k = 0;
+      while (*p && !isspace((unsigned char)*p) && k < 15) t[k++] = *p++;
+      t[k] = 0;
+      char cls = '?';
+      if (strstr(t, "u64") || strstr(t, "b64")) cls = 'p';
+      else if (strstr(t, "s64")) cls = 'l';
+      else if (strstr(t, "f32")) cls = 'f';
+      else if (strstr(t, "f64")) cls = 'd';
+      else if (strstr(t, "s32")) cls = 'i';
+      else if (strstr(t, "u32") || strstr(t, "b32") || strstr(t, "16") ||
+               strstr(t, "8")) cls = 'u';
+      if (cls == '?') { free(text); return -1; }
+      types[n++] = cls;
+    }
+    free(text);
+  }
+  return n > 0 ? n : -1;
+}
+
 int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
                          const char *kernel_name,
                          char *msl_buf, size_t msl_buf_sz,
@@ -69,7 +205,7 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
   *func_end = 0; /* null-terminate the body for scanning */
 
   /* Parse parameters from the entry signature (before the body brace) */
-  typedef struct { char name[128]; int is_ptr; } KParam;
+  typedef struct { char name[128]; int is_ptr; char ptype; } KParam;
   KParam kparams[MAX_PARAMS];
   int nkparams = 0;
   char *sig_start = strchr(entry, '(');
@@ -99,8 +235,26 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
       char cname[64];
       clean_param_name(raw_name, cname, sizeof cname);
       if (type[0] && cname[0] && nkparams < MAX_PARAMS) {
-        int is_ptr = (strstr(type, "u64") != NULL);
+        /* Classify: p=device pointer, u=uint, i=int, f=float, d=double.
+           Note: a .u64 scalar (size_t n) is indistinguishable from a pointer
+           in PTX; the shim's registry miss falls back to an 8-byte scalar. */
+        char pt;
+        int is_ptr = 0;
+        if (strstr(type, "u64") || strstr(type, "b64") || strstr(type, "s64")) {
+          is_ptr = 1;
+          pt = 'p';
+        } else if (!strcmp(type, ".f32")) pt = 'f';
+        else if (!strcmp(type, ".f64")) pt = 'd';
+        else if (!strcmp(type, ".s32")) pt = 'i';
+        else if (!strcmp(type, ".u32") || !strcmp(type, ".b32") ||
+                 strstr(type, "16") || strstr(type, "8")) pt = 'u';
+        else {
+          snprintf(err_buf, err_sz, "unsupported param type '%s'", type);
+          free(text);
+          return -1;
+        }
         kparams[nkparams].is_ptr = is_ptr;
+        kparams[nkparams].ptype = pt;
         snprintf(kparams[nkparams].name, sizeof kparams[nkparams].name, "%s", cname);
         nkparams++;
       }
@@ -116,13 +270,17 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
   EMIT("#include <metal_stdlib>\nusing namespace metal;\n\n");
   EMIT("kernel void %s_msl(\n", kernel_name);
   for (int i = 0; i < nkparams; i++) {
-    if (kparams[i].is_ptr)
+    if (kparams[i].is_ptr) {
       /* Writable (no const): output params are stored to through these bindings */
       EMIT("  device float *%s [[buffer(%d)]]%s\n",
            kparams[i].name, i, i + 1 < nkparams ? "," : "");
-    else
-      EMIT("  constant uint &%s [[buffer(%d)]]%s\n",
-           kparams[i].name, i, i + 1 < nkparams ? "," : "");
+    } else {
+      const char *ts = kparams[i].ptype == 'f' ? "float"
+                       : kparams[i].ptype == 'd' ? "double"
+                       : kparams[i].ptype == 'i' ? "int" : "uint";
+      EMIT("  constant %s &%s [[buffer(%d)]]%s\n",
+           ts, kparams[i].name, i, i + 1 < nkparams ? "," : "");
+    }
   }
   EMIT(",\n"
        "  uint _gid [[threadgroup_position_in_grid]],\n"
@@ -188,13 +346,19 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
     const char *op = toks[0];
 
     /* ld.param.u64 %rd1, [_param_0]; → register aliases the param pointer.
-       ld.param.u32 %r2, [_param_3]; → scalar param copy. */
+       Typed scalars copy with their PTX type. */
     if (ntoks >= 2 && strstr(op, "ld.param")) {
       char pname[64];
       clean_param_name(toks[2], pname, sizeof pname);
       if (strstr(op, ".u64")) {
         EMIT("  device const void *%s = %s;\n", toks[1], pname);
         mark_ptr_reg(ptr_regs, &nptr_regs, toks[1]);
+      } else if (strstr(op, ".f32")) {
+        EMIT("  float %s = %s;\n", toks[1], pname);
+      } else if (strstr(op, ".f64")) {
+        EMIT("  double %s = %s;\n", toks[1], pname);
+      } else if (strstr(op, ".s32")) {
+        EMIT("  int %s = %s;\n", toks[1], pname);
       } else {
         EMIT("  uint %s = %s;\n", toks[1], pname);
       }
