@@ -21,6 +21,8 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#import <mach-o/dyld.h>
+#import <mach-o/getsect.h>
 
 /* module_launch.m: fatbin/raw-PTX extraction + PTX→MSL translation */
 extern char *cuda_metal_extract_ptx(const void *fatbin_data, size_t fatbin_size,
@@ -372,6 +374,25 @@ float cuEventElapsedTime(CUdeviceptr start, CUdeviceptr end) {
 
 /* ---- module / kernel: v2 fatbin/raw-PTX → MSL → Metal dispatch ---------- */
 
+/* Resolve the true extent of a fatbin pointer: when it lies inside a
+   __NV_CUDA,__nv_fatbin section of any loaded Mach-O image (the layout
+   NVIDIA's fatBinaryCtl.h defines for Darwin), return the exact section
+   extent. Falls back to the caller's bound otherwise. */
+static size_t resolve_image_size(const void *image, size_t fallback) {
+  if (!image) return fallback;
+  for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+    const struct mach_header_64 *hdr =
+        (const struct mach_header_64 *)_dyld_get_image_header(i);
+    if (!hdr) continue;
+    unsigned long size = 0;
+    char *data = getsectiondata(hdr, "__NV_CUDA", "__nv_fatbin", &size);
+    if (data && size > 0 && (const char *)image >= data &&
+        (const char *)image < data + size)
+      return (size_t)(data + size - (const char *)image);
+  }
+  return fallback;
+}
+
 /* Module and function tables: a module holds its image pointer; a function
    handle (index+1) binds one kernel name to one module. */
 #define MAX_MODULES 8
@@ -448,7 +469,7 @@ int cuModuleLoadData(CUdeviceptr *module, const void *image) {
       return CUDA_ERROR_OUT_OF_MEMORY;
     }
     g_mods[g_nmods].image = image;
-    g_mods[g_nmods].size = 1 << 20; /* bounded scan; header validation gates deep reads */
+    g_mods[g_nmods].size = resolve_image_size(image, 1 << 20); /* exact when the image is a Mach-O __NV_CUDA,__nv_fatbin section; else bounded scan */
     mi = g_nmods++;
   }
   if (module) *module = (CUdeviceptr)(mi + 1); /* handle: index+1, 0 invalid */

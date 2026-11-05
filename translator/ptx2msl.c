@@ -44,6 +44,15 @@ static int op_is(const char *op, const char *name) {
   return strncmp(op, name, strlen(name)) == 0;
 }
 
+/* PTX operand → MSL operand: float immediates 0f<8hex> are bit patterns
+   (0f00000000 = 0.0f); MSL materializes them with as_type<float>. */
+static void ptx_val(const char *tok, char *out, size_t outsz) {
+  if (tok[0] == '0' && tok[1] == 'f' && strlen(tok) == 10)
+    snprintf(out, outsz, "as_type<float>(0x%su)", tok + 2);
+  else
+    snprintf(out, outsz, "%s", tok);
+}
+
 /* Registers known to hold device pointers (ld.param.u64 / cvta chains) */
 static int is_ptr_reg(char regs[][32], int n, const char *r) {
   for (int i = 0; i < n; i++) if (!strcmp(regs[i], r)) return 1;
@@ -484,6 +493,14 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
       continue;
     }
 
+    /* mov.f32 %f, <imm|reg>; → float moves incl. 0f<8hex> bit patterns */
+    if (ntoks >= 3 && !strcmp(op, "mov.f32")) {
+      char v[96];
+      ptx_val(toks[2], v, sizeof v);
+      EMIT("  float %s = %s;\n", toks[1], v);
+      continue;
+    }
+
     /* mov.u32 %r3, %ctaid.x; → CUDA thread coordinates as MSL builtins.
        mov.u32 %r8, _sdata; → the shared base becomes a threadgroup pointer. */
     if (ntoks >= 3 && !strcmp(op, "mov.u32")) {
@@ -576,6 +593,42 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
       if (ntoks >= 4)
         EMIT("  %s %s = %s >> %s;\n",
              op_is(op, "shr.s32") ? "int" : "uint", toks[1], toks[2], toks[3]);
+      continue;
+    }
+
+    /* selp.<type> d, a, b, c; → d = c ? a : b (float/int; operands may be
+       0f<8hex> immediates) */
+    if (op_is(op, "selp")) {
+      if (ntoks >= 5) {
+        const char *ts = op_is(op, "selp.f32") ? "float"
+                         : op_is(op, "selp.f64") ? "double"
+                         : op_is(op, "selp.s32") ? "int" : "int";
+        char va[96], vb[96];
+        ptx_val(toks[2], va, sizeof va);
+        ptx_val(toks[3], vb, sizeof vb);
+        EMIT("  %s %s = (%s) ? (%s) : (%s);\n", ts, toks[1], toks[4], va, vb);
+      }
+      continue;
+    }
+
+    /* shfl.sync.<mode>.b32 d, a, b, c; → warp shuffles. PTX warp (32 lanes)
+       = MSL simdgroup exactly. b32 bit-pattern semantics: the measured
+       subset shuffles float values; mode maps: idx→simd_shuffle,
+       up/down→simd_shuffle_up/down, xor/bfly→simd_shuffle_xor. The clamp
+       operand (c, typically 31) is implied by the simdgroup. */
+    if (op_is(op, "shfl")) {
+      const char *fn = NULL;
+      if (strstr(op, ".idx")) fn = "simd_shuffle";
+      else if (strstr(op, ".up")) fn = "simd_shuffle_up";
+      else if (strstr(op, ".down")) fn = "simd_shuffle_down";
+      else if (strstr(op, ".xor") || strstr(op, ".bfly") || strstr(op, ".fly"))
+        fn = "simd_shuffle_xor";
+      if (!fn) {
+        snprintf(err_buf, err_sz, "unsupported shuffle mode '%s'", op);
+        free(text);
+        return -1;
+      }
+      if (ntoks >= 5) EMIT("  float %s = %s(%s, %s);\n", toks[1], fn, toks[2], toks[3]);
       continue;
     }
 
@@ -703,9 +756,17 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
       base_reg[k < sizeof(base_reg) - 1 ? k : sizeof(base_reg) - 1] = 0;
       if (addr[k]) snprintf(offset_str, sizeof offset_str, "%s", addr + k);
       if (!is_ptr_reg(sh_ptr_regs, nsh_ptr, base_reg)) {
-        snprintf(err_buf, err_sz, "ld.shared through non-shared register '%s'", base_reg);
-        free(text);
-        return -1;
+        /* Single-__shared__ heuristic: a raw integer address is a byte
+           offset into the only shared array. Multi-var kernels hard-fail. */
+        if (nshared != 1) {
+          snprintf(err_buf, err_sz, "ld.shared through non-shared register '%s'", base_reg);
+          free(text);
+          return -1;
+        }
+        const char *off = (base_reg[0] && strcmp(offset_str, "0") == 0) ? base_reg : offset_str;
+        EMIT("  float %s = *(threadgroup float *)((threadgroup char *)(%s) + (long)(%s));\n",
+             toks[1], sh_names[0], off);
+        continue;
       }
       EMIT("  float %s = *(threadgroup float *)((threadgroup char *)%s + %s);\n",
            toks[1], base_reg, offset_str);
@@ -728,9 +789,15 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
       base_reg[k < sizeof(base_reg) - 1 ? k : sizeof(base_reg) - 1] = 0;
       if (addr[k]) snprintf(offset_str, sizeof offset_str, "%s", addr + k);
       if (!is_ptr_reg(sh_ptr_regs, nsh_ptr, base_reg)) {
-        snprintf(err_buf, err_sz, "st.shared through non-shared register '%s'", base_reg);
-        free(text);
-        return -1;
+        if (nshared != 1) {
+          snprintf(err_buf, err_sz, "st.shared through non-shared register '%s'", base_reg);
+          free(text);
+          return -1;
+        }
+        const char *off = (base_reg[0] && strcmp(offset_str, "0") == 0) ? base_reg : offset_str;
+        EMIT("  *(threadgroup float *)((threadgroup char *)(%s) + (long)(%s)) = %s;\n",
+             sh_names[0], off, ntoks >= 3 ? toks[2] : "0");
+        continue;
       }
       EMIT("  *(threadgroup float *)((threadgroup char *)%s + %s) = %s;\n",
            base_reg, offset_str, ntoks >= 3 ? toks[2] : "0");

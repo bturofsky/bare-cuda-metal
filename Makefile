@@ -5,7 +5,7 @@ CC = clang
 CFLAGS = -O2 -Wall -Wextra -dynamiclib
 SHIM = shim/libcuda_shim.dylib
 
-all: $(SHIM) test_run scan/scan gemm_ab v2_launch v2_fatbin v2_multi v2_loop v2_reduce v2_stream
+all: $(SHIM) test_run scan/scan gemm_ab v2_launch v2_fatbin v2_multi v2_loop v2_reduce v2_stream v2_realfat v2_section v2_simd
 
 CUBLAS_SHIM = shim/libcublas_shim.dylib
 $(CUBLAS_SHIM): shim/libcublas_shim.m
@@ -41,10 +41,22 @@ v2_reduce: $(SHIM) test/v2_reduce.c
 v2_stream: $(SHIM) test/v2_stream.c
 	$(CC) -O2 -Wall -o $@ test/v2_stream.c $(SHIM)
 
+v2_realfat: $(SHIM) test/v2_realfat.c
+	$(CC) -O2 -Wall -o $@ test/v2_realfat.c $(SHIM)
+
+v2_simd: $(SHIM) test/v2_simd.c
+	$(CC) -O2 -Wall -o $@ test/v2_simd.c $(SHIM)
+
+test/nv_fatbin_section.h: docs/reference/vectorAdd.real.fatbin
+	python3 -c "import sys; d=open('docs/reference/vectorAdd.real.fatbin','rb').read(); print('#include <stddef.h>'); print('__attribute__((used, section(\"__NV_CUDA,__nv_fatbin\"))) static const unsigned char g_nv_fatbin[] = {' + ','.join(str(b) for b in d) + '};')" > $@
+
+v2_section: $(SHIM) test/v2_section.c test/nv_fatbin_section.h
+	$(CC) -O2 -Wall -o $@ test/v2_section.c $(SHIM)
+
 scan/scan: scan/scan.c scan/zstd_decomp.c
 	$(CC) -O2 -Wall -DHAVE_ZSTD -I/opt/homebrew/include -o $@ scan/scan.c scan/zstd_decomp.c scan/lz4_block.c -lz -L/opt/homebrew/lib -lzstd -L/opt/homebrew/opt/lz4/lib -llz4
 
 clean:
-	rm -f $(SHIM) test/test_harness v2_launch v2_fatbin v2_multi v2_loop v2_reduce v2_stream
+	rm -f $(SHIM) test/test_harness v2_launch v2_fatbin v2_multi v2_loop v2_reduce v2_stream v2_realfat v2_section v2_simd test/nv_fatbin_section.h
 
 .PHONY: all test_run clean

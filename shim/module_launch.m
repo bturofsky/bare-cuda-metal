@@ -82,21 +82,29 @@ static stored_module g_modules[MAX_MODULES];
 static int g_nmodules = 0;
 static pthread_mutex_t g_module_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* ---- LZ4 decompress ------------------------------------------------------- */
+/* ---- nvcc LZ77 decompress --------------------------------------------------
+   nvcc compressed PTX entries use LZ4-token framing but the payload may carry
+   an UNCOMPRESSED FOOTER after the compressed stream. When `expected` (the
+   entry's decompressed_size) is known the loop is output-bounded: it stops
+   the moment the target is reached and the footer is never interpreted as
+   tokens. Only when expected==0 (unknown) does it fall back to input-bounded. */
 static unsigned char *lz4_decomp(const unsigned char *in, size_t inlen,
                                  size_t expected, size_t *outlen) {
   size_t cap = expected ? expected + 1024 : inlen * 6 + 1024;
   unsigned char *out = malloc(cap);
   if (!out) return NULL;
   size_t ip = 0, op = 0;
-  while (ip < inlen) {
+  while (ip < inlen && (expected == 0 || op < expected)) {
     unsigned token = in[ip++];
     unsigned lit = token >> 4;
     if (lit == 15) { unsigned s; do { s = in[ip++]; lit += s; } while (s == 255 && ip < inlen); }
     if (op + lit > cap) { cap = (op + lit) * 2 + 1024; out = realloc(out, cap); if (!out) return NULL; }
     if (ip + lit > inlen) { free(out); return NULL; }
-    memcpy(out + op, in + ip, lit);
-    ip += lit; op += lit;
+    size_t take = lit;
+    if (expected && op + take > expected) take = expected - op;
+    memcpy(out + op, in + ip, take);
+    ip += lit; op += take;
+    if (expected && op >= expected) break;
     if (ip >= inlen) break;
     if (ip + 2 > inlen) { free(out); return NULL; }
     unsigned offset = in[ip] | ((unsigned)in[ip + 1] << 8);
@@ -106,7 +114,9 @@ static unsigned char *lz4_decomp(const unsigned char *in, size_t inlen,
     if ((token & 0x0f) == 15) { unsigned s; do { s = in[ip++]; match += s; } while (s == 255 && ip < inlen); }
     if (op + match > cap) { cap = (op + match) * 2 + 1024; out = realloc(out, cap); if (!out) return NULL; }
     unsigned char *mp = out + op - offset;
-    for (unsigned k = 0; k < match; k++) out[op++] = mp[k];
+    size_t mtake = match;
+    if (expected && op + mtake > expected) mtake = expected - op;
+    for (size_t k = 0; k < mtake; k++) out[op++] = mp[k];
   }
   *outlen = op;
   return out;
@@ -144,7 +154,11 @@ static char *extract_ptx(const void *data, size_t data_size, size_t *ptx_len) {
             /* Handle compression */
             if (fe.flags & FFLAG_LZ4) {
               size_t dec_len = 0;
-              unsigned char *dec = lz4_decomp(ptx_payload, plen,
+              /* compressed_size is the tighter input bound; the rest of the
+                 payload may be an uncompressed footer */
+              size_t cin = (fe.compressed_size && fe.compressed_size < plen)
+                               ? fe.compressed_size : plen;
+              unsigned char *dec = lz4_decomp(ptx_payload, cin,
                                               (size_t)fe.uncompressed_payload, &dec_len);
               if (dec) {
                 char *result = malloc(dec_len + 1);
