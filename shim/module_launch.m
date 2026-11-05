@@ -194,8 +194,14 @@ static char *extract_ptx(const void *data, size_t data_size, size_t *ptx_len) {
    that kernel's .entry, or NULL if not found. */
 char *cuda_metal_extract_ptx(const void *fatbin_data, size_t fatbin_size,
                              const char *kernel_name, size_t *ptx_len) {
+  /* Container magic wins over the raw-PTX heuristic: a real fatbin starts
+     with the magic, and its PTX payload would otherwise false-positive the
+     ".entry" probe below. */
+  const uint32_t magic_at_0 = fatbin_data && fatbin_size >= 4
+                                  ? *(const uint32_t *)fatbin_data : 0;
+
   /* Raw PTX input: cuModuleLoadData also accepts plain PTX text as the image */
-  if (fatbin_data && fatbin_size >= 16) {
+  if (fatbin_data && fatbin_size >= 16 && magic_at_0 != 0xBA55ED50u) {
     size_t probe_len = fatbin_size < 4096 ? fatbin_size : 4096;
     if (memcmp(fatbin_data, ".version", 8) == 0 ||
         memmem(fatbin_data, probe_len, ".entry", 6)) {

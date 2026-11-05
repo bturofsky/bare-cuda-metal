@@ -26,6 +26,9 @@
 extern char *cuda_metal_extract_ptx(const void *fatbin_data, size_t fatbin_size,
                                     const char *kernel_name, size_t *ptx_len);
 extern char *cuda_metal_translate(const char *ptx, size_t ptx_len, const char *kernel_name);
+extern int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
+                                const char *kernel_name, char *msl_buf,
+                                size_t msl_buf_sz, char *err_buf, size_t err_sz);
 
 enum {
   CUDA_SUCCESS = 0,
@@ -338,23 +341,29 @@ int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsi
     return CUDA_ERROR_NOT_INITIALIZED;
   }
 
-  /* 1. image → PTX → MSL */
-  size_t ptx_len = 0;
-  char *ptx = cuda_metal_extract_ptx(g_image_ptr, g_image_size, g_kernel_name, &ptx_len);
-  if (!ptx) {
-    slog("cuLaunchKernel", "no PTX found for %s in image", g_kernel_name);
-    return CUDA_ERROR_NOT_SUPPORTED;
-  }
-  char *msl = cuda_metal_translate(ptx, ptx_len, g_kernel_name);
-  free(ptx);
-  if (!msl) {
-    slog("cuLaunchKernel", "PTX→MSL translation failed for %s", g_kernel_name);
-    return CUDA_ERROR_NOT_SUPPORTED;
-  }
-
-  /* 2. pipeline state — cached per (image, kernel) after the first launch */
+  /* 1. pipeline state — cached per (image, kernel); extract+translate only
+     on a miss so cached launches skip the PTX work entirely */
   id<MTLComputePipelineState> pso = cached_pso(g_kernel_name, g_image_ptr);
   if (!pso) {
+    size_t ptx_len = 0;
+    char *ptx = cuda_metal_extract_ptx(g_image_ptr, g_image_size, g_kernel_name, &ptx_len);
+    if (!ptx) {
+      slog("cuLaunchKernel", "no PTX found for %s in image", g_kernel_name);
+      return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    /* translate directly so the translator's error reaches the log */
+    char terr[256] = "";
+    char *msl = malloc(16384);
+    int trc = translate_ptx_kernel(ptx, ptx_len, g_kernel_name, msl, 16384,
+                                   terr, sizeof terr);
+    free(ptx);
+    if (trc != 0) {
+      slog("cuLaunchKernel", "PTX→MSL translation failed for %s: %s",
+           g_kernel_name, terr[0] ? terr : "unknown");
+      free(msl);
+      return CUDA_ERROR_NOT_SUPPORTED;
+    }
+
     NSError *err = nil;
     id<MTLLibrary> lib = [g_device newLibraryWithSource:@(msl) options:nil error:&err];
     if (!lib) {
@@ -379,10 +388,10 @@ int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsi
     }
     cache_pso(g_kernel_name, g_image_ptr, pso);
     slog("cuLaunchKernel", "MSL compiled and cached");
+    free(msl);
   } else {
     slog("cuLaunchKernel", "pipeline cache hit");
   }
-  free(msl);
 
   /* 3. bind params: device pointers resolve through the allocation registry
      to real MTLBuffers; anything else is a u32 scalar (measured subset).
