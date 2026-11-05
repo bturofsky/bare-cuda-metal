@@ -37,6 +37,13 @@ static void label_clean(const char *tok, char *out, size_t outsz) {
   out[k] = 0;
 }
 
+/* Opcode family match on the FIRST token: prefix + suffix allowed
+   (ld.global matches ld.global.f32). Never use strstr on opcodes —
+   "atom.global.add.u32" contains "add.u32". */
+static int op_is(const char *op, const char *name) {
+  return strncmp(op, name, strlen(name)) == 0;
+}
+
 /* Registers known to hold device pointers (ld.param.u64 / cvta chains) */
 static int is_ptr_reg(char regs[][32], int n, const char *r) {
   for (int i = 0; i < n; i++) if (!strcmp(regs[i], r)) return 1;
@@ -280,7 +287,7 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
   size_t bpos = 0;
   #define EMIT(...) do { if (bpos < sizeof body_buf - 1) bpos += (size_t)snprintf(body_buf + bpos, sizeof body_buf - 1 - bpos, __VA_ARGS__); } while(0)
 
-  EMIT("#include <metal_stdlib>\nusing namespace metal;\n\n");
+  EMIT("#include <metal_stdlib>\n#include <metal_atomic>\nusing namespace metal;\n\n");
   EMIT("kernel void %s_msl(\n", kernel_name);
   for (int i = 0; i < nkparams; i++) {
     if (kparams[i].is_ptr) {
@@ -305,6 +312,8 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
 
   char ptr_regs[64][32];
   int nptr_regs = 0;
+  char sh_ptr_regs[64][32];
+  int nsh_ptr = 0;
 
   /* MSL has no goto/labels. Control flow is translated to a program-counter
      switch loop: each chunk of straight-line code between labels becomes a
@@ -312,12 +321,17 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
 
   /* Pass A: collect labels → chunk ids and count chunks. A chunk boundary
      is created by a label AND by a branch instruction (the code after a
-     predicated branch is the fallthrough chunk). Chunk 0 = code before the
-     first boundary. */
+     predicated branch is its own chunk). Chunk 0 = code before the first
+     boundary. Also collects __shared__ declarations. */
   char label_names[32][64];
   int label_chunks[32];
   int nlabels = 0;
   int nchunks = 1;
+  char sh_names[8][64];
+  int sh_sizes[8];
+  int nshared = 0;
+  char sdecls[2048];
+  size_t spos = 0;
   {
     char *p = body;
     while (p < func_end) {
@@ -333,7 +347,36 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
         int is_branch =
             (strncmp(ls2, "bra", 3) == 0 && !isalnum((unsigned char)ls2[3])) ||
             strstr(ls2, " bra ") != NULL;
-        if (*ls2 == '$') {
+        if (strncmp(ls2, ".shared", 7) == 0 && nshared < 8) {
+          /* .shared .align 4 .b8 name[size]; → threadgroup array */
+          const char *br = strchr(ls2, '[');
+          const char *brk = br ? strchr(br, ']') : NULL;
+          if (br && brk) {
+            const char *e = br;
+            while (e > ls2 && isspace((unsigned char)e[-1])) e--;
+            const char *b2 = e;
+            while (b2 > ls2 &&
+                   (isalnum((unsigned char)b2[-1]) || b2[-1] == '_' || b2[-1] == '$'))
+              b2--;
+            size_t nm_len = (size_t)(e - b2);
+            if (nm_len > 0 && nm_len < 64) {
+              char nm[64];
+              memcpy(nm, b2, nm_len);
+              nm[nm_len] = 0;
+              char cnm[64];
+              label_clean(nm, cnm, sizeof cnm);
+              if (cnm[0] && spos + nm_len + 48 < sizeof sdecls) {
+                int elems = (atoi(br + 1) + 3) / 4;
+                if (elems < 1) elems = 1;
+                snprintf(sh_names[nshared], sizeof sh_names[0], "%s", cnm);
+                sh_sizes[nshared] = elems * 4;
+                nshared++;
+                spos += (size_t)snprintf(sdecls + spos, sizeof sdecls - 1 - spos,
+                                         "  threadgroup float %s[%d];\n", cnm, elems);
+              }
+            }
+          }
+        } else if (*ls2 == '$') {
           if (nlabels < 32) {
             label_clean(ls2, label_names[nlabels], sizeof label_names[nlabels]);
             nchunks++;
@@ -423,7 +466,7 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
 
     /* ld.param.u64 %rd1, [_param_0]; → register aliases the param pointer.
        Typed scalars copy with their PTX type. */
-    if (ntoks >= 2 && strstr(op, "ld.param")) {
+    if (ntoks >= 2 && op_is(op, "ld.param")) {
       char pname[64];
       clean_param_name(toks[2], pname, sizeof pname);
       if (strstr(op, ".u64")) {
@@ -441,8 +484,19 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
       continue;
     }
 
-    /* mov.u32 %r3, %ctaid.x; → CUDA thread coordinates as MSL builtins */
+    /* mov.u32 %r3, %ctaid.x; → CUDA thread coordinates as MSL builtins.
+       mov.u32 %r8, _sdata; → the shared base becomes a threadgroup pointer. */
     if (ntoks >= 3 && !strcmp(op, "mov.u32")) {
+      char cand[64];
+      label_clean(toks[2], cand, sizeof cand);
+      int is_shared_base = 0;
+      for (int i = 0; i < nshared; i++)
+        if (strcmp(sh_names[i], cand) == 0) { is_shared_base = 1; break; }
+      if (is_shared_base) {
+        EMIT("  threadgroup float *%s = %s;\n", toks[1], cand);
+        mark_ptr_reg(sh_ptr_regs, &nsh_ptr, toks[1]);
+        continue;
+      }
       /* check nctaid first: "nctaid" contains "ctaid" */
       if (strstr(toks[2], "nctaid"))
         EMIT("  uint %s = _ngid;\n", toks[1]);
@@ -459,7 +513,7 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
 
     /* cvta.to.global — identity on unified memory, but the destination
        register must still be defined (it feeds add.s64 chains) */
-    if (strstr(op, "cvta.to.global")) {
+    if (op_is(op, "cvta.to.global")) {
       if (ntoks >= 3) {
         EMIT("  device const void *%s = %s;\n", toks[1], toks[2]);
         mark_ptr_reg(ptr_regs, &nptr_regs, toks[1]);
@@ -467,52 +521,124 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
       continue;
     }
 
+    /* cvta.to.shared — shared-space alias */
+    if (op_is(op, "cvta.to.shared")) {
+      if (ntoks >= 3) {
+        if (!is_ptr_reg(sh_ptr_regs, nsh_ptr, toks[2])) {
+          snprintf(err_buf, err_sz, "cvta.to.shared on non-shared register '%s'", toks[2]);
+          free(text);
+          return -1;
+        }
+        EMIT("  threadgroup float *%s = %s;\n", toks[1], toks[2]);
+        mark_ptr_reg(sh_ptr_regs, &nsh_ptr, toks[1]);
+      }
+      continue;
+    }
+
     /* mad.lo.s32 %r1, %r3, %r4, %r5; → r1 = r3 * r4 + r5 */
-    if (strstr(op, "mad.lo")) {
+    if (op_is(op, "mad.lo")) {
       if (ntoks >= 5) EMIT("  int %s = %s * %s + %s;\n", toks[1], toks[2], toks[3], toks[4]);
       continue;
     }
 
     /* mul.wide.s32 %rd, %r, %r; → long */
-    if (strstr(op, "mul.wide")) {
+    if (op_is(op, "mul.wide")) {
       if (ntoks >= 4) EMIT("  long %s = (long)%s * (long)%s;\n", toks[1], toks[2], toks[3]);
       continue;
     }
 
     /* mul.lo.s32 %r, %r, %r; → int multiply */
-    if (strstr(op, "mul.lo")) {
+    if (op_is(op, "mul.lo")) {
       if (ntoks >= 4) EMIT("  int %s = %s * %s;\n", toks[1], toks[2], toks[3]);
       continue;
     }
 
-    /* add.s32 / add.u32 — the grid-stride loop increment */
-    if (strstr(op, "add.s32") || strstr(op, "add.u32")) {
-      if (ntoks >= 4) EMIT("  int %s = %s + %s;\n", toks[1], toks[2], toks[3]);
+    /* add.s32 / add.u32 — int adds and shared-pointer arithmetic */
+    if (op_is(op, "add.s32") || op_is(op, "add.u32")) {
+      if (ntoks >= 4) {
+        if (is_ptr_reg(sh_ptr_regs, nsh_ptr, toks[2])) {
+          EMIT("  threadgroup float *%s = (threadgroup float *)((threadgroup char *)%s + (long)%s);\n",
+               toks[1], toks[2], toks[3]);
+          mark_ptr_reg(sh_ptr_regs, &nsh_ptr, toks[1]);
+        } else if (is_ptr_reg(sh_ptr_regs, nsh_ptr, toks[3])) {
+          EMIT("  threadgroup float *%s = (threadgroup float *)((threadgroup char *)%s + (long)%s);\n",
+               toks[1], toks[3], toks[2]);
+          mark_ptr_reg(sh_ptr_regs, &nsh_ptr, toks[1]);
+        } else {
+          EMIT("  int %s = %s + %s;\n", toks[1], toks[2], toks[3]);
+        }
+      }
+      continue;
+    }
+
+    /* shr.u32 / shr.s32 — the reduction loop halving */
+    if (op_is(op, "shr.u32") || op_is(op, "shr.s32")) {
+      if (ntoks >= 4)
+        EMIT("  %s %s = %s >> %s;\n",
+             op_is(op, "shr.s32") ? "int" : "uint", toks[1], toks[2], toks[3]);
+      continue;
+    }
+
+    /* bar.sync 0; → threadgroup barrier */
+    if (!strcmp(op, "bar.sync")) {
+      EMIT("      threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+      continue;
+    }
+
+    /* atom.global.add.u32 / red.global.add.u32 — device-memory atomics.
+       atom: %rd,[%addr],%val; red: [%addr],%val; */
+    if (op_is(op, "atom.global") || op_is(op, "red.global")) {
+      if (!strstr(op, ".u32")) {
+        snprintf(err_buf, err_sz, "unsupported atomic width '%s'", op);
+        free(text);
+        return -1;
+      }
+      int is_red = op_is(op, "red.global");
+      const char *addr_tok = is_red ? toks[1] : toks[2];
+      const char *val_tok = is_red ? toks[2] : toks[3];
+      char base_reg[64] = "";
+      char offset_str[64] = "0";
+      const char *addr = addr_tok ? addr_tok : "";
+      if (isdigit((unsigned char)addr[0])) {
+        snprintf(offset_str, sizeof offset_str, "%s", addr);
+      } else {
+        size_t k = 0;
+        while (addr[k] && (isalnum((unsigned char)addr[k]) || addr[k] == '_')) k++;
+        strncpy(base_reg, addr, k < sizeof(base_reg) - 1 ? k : sizeof(base_reg) - 1);
+        base_reg[k < sizeof(base_reg) - 1 ? k : sizeof(base_reg) - 1] = 0;
+        if (addr[k]) snprintf(offset_str, sizeof offset_str, "%s", addr + k);
+      }
+      if (is_red)
+        EMIT("      atomic_fetch_add_explicit((device atomic_uint *)((device char *)%s + %s), %s, memory_order_relaxed);\n",
+             base_reg, offset_str, val_tok ? val_tok : "0");
+      else if (ntoks >= 4)
+        EMIT("  uint %s = atomic_fetch_add_explicit((device atomic_uint *)((device char *)%s + %s), %s, memory_order_relaxed);\n",
+             toks[1], base_reg, offset_str, val_tok ? val_tok : "0");
       continue;
     }
 
     /* setp.ge.s32 %p1, %r1, %r2; → comparison */
-    if (strstr(op, "setp.ge")) {
+    if (op_is(op, "setp.ge")) {
       if (ntoks >= 4) EMIT("  bool %s = (%s >= %s);\n", toks[1], toks[2], toks[3]);
       continue;
     }
-    if (strstr(op, "setp.gt")) {
+    if (op_is(op, "setp.gt")) {
       if (ntoks >= 4) EMIT("  bool %s = (%s > %s);\n", toks[1], toks[2], toks[3]);
       continue;
     }
-    if (strstr(op, "setp.lt")) {
+    if (op_is(op, "setp.lt")) {
       if (ntoks >= 4) EMIT("  bool %s = (%s < %s);\n", toks[1], toks[2], toks[3]);
       continue;
     }
-    if (strstr(op, "setp.le")) {
+    if (op_is(op, "setp.le")) {
       if (ntoks >= 4) EMIT("  bool %s = (%s <= %s);\n", toks[1], toks[2], toks[3]);
       continue;
     }
-    if (strstr(op, "setp.eq")) {
+    if (op_is(op, "setp.eq")) {
       if (ntoks >= 4) EMIT("  bool %s = (%s == %s);\n", toks[1], toks[2], toks[3]);
       continue;
     }
-    if (strstr(op, "setp.ne")) {
+    if (op_is(op, "setp.ne")) {
       if (ntoks >= 4) EMIT("  bool %s = (%s != %s);\n", toks[1], toks[2], toks[3]);
       continue;
     }
@@ -559,8 +685,60 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
       continue;
     }
 
+    /* ld.shared.f32 [%rN]; → threadgroup-space load. The address register
+       must be a known shared pointer (raw shared offsets cannot be resolved
+       to a specific __shared__ array). */
+    if (op_is(op, "ld.shared")) {
+      if (!strstr(op, ".f32")) {
+        snprintf(err_buf, err_sz, "unsupported load type '%s'", op);
+        free(text);
+        return -1;
+      }
+      char base_reg[64] = "";
+      char offset_str[64] = "0";
+      const char *addr = ntoks >= 3 ? toks[2] : "";
+      size_t k = 0;
+      while (addr[k] && (isalnum((unsigned char)addr[k]) || addr[k] == '_')) k++;
+      strncpy(base_reg, addr, k < sizeof(base_reg) - 1 ? k : sizeof(base_reg) - 1);
+      base_reg[k < sizeof(base_reg) - 1 ? k : sizeof(base_reg) - 1] = 0;
+      if (addr[k]) snprintf(offset_str, sizeof offset_str, "%s", addr + k);
+      if (!is_ptr_reg(sh_ptr_regs, nsh_ptr, base_reg)) {
+        snprintf(err_buf, err_sz, "ld.shared through non-shared register '%s'", base_reg);
+        free(text);
+        return -1;
+      }
+      EMIT("  float %s = *(threadgroup float *)((threadgroup char *)%s + %s);\n",
+           toks[1], base_reg, offset_str);
+      continue;
+    }
+
+    /* st.shared.f32 [%rN], %fX; → threadgroup-space store */
+    if (op_is(op, "st.shared")) {
+      if (!strstr(op, ".f32")) {
+        snprintf(err_buf, err_sz, "unsupported store type '%s'", op);
+        free(text);
+        return -1;
+      }
+      char base_reg[64] = "";
+      char offset_str[64] = "0";
+      const char *addr = ntoks >= 2 ? toks[1] : "";
+      size_t k = 0;
+      while (addr[k] && (isalnum((unsigned char)addr[k]) || addr[k] == '_')) k++;
+      strncpy(base_reg, addr, k < sizeof(base_reg) - 1 ? k : sizeof(base_reg) - 1);
+      base_reg[k < sizeof(base_reg) - 1 ? k : sizeof(base_reg) - 1] = 0;
+      if (addr[k]) snprintf(offset_str, sizeof offset_str, "%s", addr + k);
+      if (!is_ptr_reg(sh_ptr_regs, nsh_ptr, base_reg)) {
+        snprintf(err_buf, err_sz, "st.shared through non-shared register '%s'", base_reg);
+        free(text);
+        return -1;
+      }
+      EMIT("  *(threadgroup float *)((threadgroup char *)%s + %s) = %s;\n",
+           base_reg, offset_str, ntoks >= 3 ? toks[2] : "0");
+      continue;
+    }
+
     /* ld.global.f32 %f1, [%rd8+4]; → device-space load. */
-    if (strstr(op, "ld.global")) {
+    if (op_is(op, "ld.global")) {
       if (!strstr(op, ".f32")) { /* only f32 loads in the measured subset */
         snprintf(err_buf, err_sz, "unsupported load type '%s'", op);
         free(text);
@@ -590,7 +768,7 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
     }
 
     /* st.global.f32 [%rd10], %f3; → store to global memory */
-    if (strstr(op, "st.global")) {
+    if (op_is(op, "st.global")) {
       char base_reg[64] = "";
       char offset_str[64] = "0";
       const char *addr = ntoks >= 2 ? toks[1] : "";
@@ -610,28 +788,36 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
     }
 
     /* add.f32 / sub.f32 / mul.f32 / fma.rn.f32 */
-    if (strstr(op, "add.f32")) {
+    if (op_is(op, "add.f32")) {
       if (ntoks >= 4) EMIT("  float %s = %s + %s;\n", toks[1], toks[2], toks[3]);
       continue;
     }
-    if (strstr(op, "sub.f32")) {
+    if (op_is(op, "sub.f32")) {
       if (ntoks >= 4) EMIT("  float %s = %s - %s;\n", toks[1], toks[2], toks[3]);
       continue;
     }
-    if (strstr(op, "mul.f32")) {
+    if (op_is(op, "mul.f32")) {
       if (ntoks >= 4) EMIT("  float %s = %s * %s;\n", toks[1], toks[2], toks[3]);
       continue;
     }
-    if (strstr(op, "fma.rn.f32")) {
+    if (op_is(op, "fma.rn.f32")) {
       if (ntoks >= 5) EMIT("  float %s = fma(%s, %s, %s);\n", toks[1], toks[2], toks[3], toks[4]);
       continue;
     }
 
-    /* add.s64 / add.u64 — pointer-aware: when an operand is a known device
-       pointer register, keep the sum in the device address space */
-    if (strstr(op, "add.s64") || strstr(op, "add.u64")) {
+    /* add.s64 / add.u64 — pointer-aware: shared-space sums stay in the
+       threadgroup space, device-space sums stay in the device space */
+    if (op_is(op, "add.s64") || op_is(op, "add.u64")) {
       if (ntoks >= 4) {
-        if (is_ptr_reg(ptr_regs, nptr_regs, toks[2])) {
+        if (is_ptr_reg(sh_ptr_regs, nsh_ptr, toks[2])) {
+          EMIT("  threadgroup float *%s = (threadgroup float *)((threadgroup char *)%s + (long)%s);\n",
+               toks[1], toks[2], toks[3]);
+          mark_ptr_reg(sh_ptr_regs, &nsh_ptr, toks[1]);
+        } else if (is_ptr_reg(sh_ptr_regs, nsh_ptr, toks[3])) {
+          EMIT("  threadgroup float *%s = (threadgroup float *)((threadgroup char *)%s + (long)%s);\n",
+               toks[1], toks[3], toks[2]);
+          mark_ptr_reg(sh_ptr_regs, &nsh_ptr, toks[1]);
+        } else if (is_ptr_reg(ptr_regs, nptr_regs, toks[2])) {
           EMIT("  device const char *%s = (device const char *)%s + (long)%s;\n",
                toks[1], toks[2], toks[3]);
           mark_ptr_reg(ptr_regs, &nptr_regs, toks[1]);
@@ -672,7 +858,7 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
      cases share one scope (C++ forbids jumping over initialized decls),
      then append the processed body ---- */
   static const char *ktypes[] = {
-      "device const void *", "device const char *",
+      "device const void *", "device const char *", "threadgroup float *",
       "uint", "int", "long", "bool", "float", "double"};
   const int nktypes = (int)(sizeof ktypes / sizeof ktypes[0]);
   char hoist[6144];
@@ -743,7 +929,7 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
     }
   }
 
-  size_t need = header_len + hpos + fpos + 4;
+  size_t need = header_len + hpos + spos + fpos + 4;
   if (need > msl_buf_sz - 1 || bpos >= sizeof body_buf - 1 ||
       hpos >= sizeof hoist - 1 || fpos >= sizeof fbody - 1) {
     snprintf(err_buf, err_sz, "MSL output truncated");
@@ -752,10 +938,11 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
   }
   memcpy(msl_buf, body_buf, header_len);
   memcpy(msl_buf + header_len, hoist, hpos);
-  memcpy(msl_buf + header_len + hpos, fbody, fpos);
-  msl_buf[header_len + hpos + fpos] = '}';
-  msl_buf[header_len + hpos + fpos + 1] = '\n';
-  msl_buf[header_len + hpos + fpos + 2] = 0;
+  memcpy(msl_buf + header_len + hpos, sdecls, spos);
+  memcpy(msl_buf + header_len + hpos + spos, fbody, fpos);
+  msl_buf[header_len + hpos + spos + fpos] = '}';
+  msl_buf[header_len + hpos + spos + fpos + 1] = '\n';
+  msl_buf[header_len + hpos + spos + fpos + 2] = 0;
   free(text);
   return 0;
 }

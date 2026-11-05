@@ -245,26 +245,129 @@ int cuMemcpyDtoH(void *dst, CUdeviceptr src, size_t bytes) {
   return CUDA_SUCCESS;
 }
 
-/* ---- streams / events --------------------------------------------------- */
+/* ---- streams / events: real queues, async commit, GPU timestamps -------- */
+
+/* Streams keep strong queue references (the old __bridge cast leaked the
+   queue the moment the local went out of scope). Named streams commit
+   asynchronously; cuStreamSynchronize waits on the stream's last buffer.
+   The default stream (0) keeps the legacy synchronous path. */
+#define MAX_STREAMS 8
+#define MAX_EVENTS 8
+typedef struct {
+  int used;
+  id<MTLCommandQueue> q;
+  id<MTLCommandBuffer> last_cb;
+} stream_rec;
+static stream_rec g_streams[MAX_STREAMS];
+typedef struct {
+  int used;
+  id<MTLCommandBuffer> cb;
+} event_rec;
+static event_rec g_events[MAX_EVENTS];
+
+static id<MTLCommandQueue> queue_for(CUdeviceptr h) {
+  if (h == 0) return g_queue;
+  int i = (int)h - 1;
+  if (i < 0 || i >= MAX_STREAMS || !g_streams[i].used) return nil;
+  return g_streams[i].q;
+}
+static id<MTLCommandBuffer> *last_cb_slot(CUdeviceptr h) {
+  if (h == 0) return NULL;
+  int i = (int)h - 1;
+  if (i < 0 || i >= MAX_STREAMS || !g_streams[i].used) return NULL;
+  return &g_streams[i].last_cb;
+}
+
 int cuStreamCreate(CUdeviceptr *stream, unsigned flags) {
   slog("cuStreamCreate", "flags=0x%x", flags);
-  id<MTLCommandQueue> q = [g_device newCommandQueue];
-  if (stream) *stream = (CUdeviceptr)(__bridge void *)q;
+  if (!g_device) return CUDA_ERROR_NOT_INITIALIZED;
+  int slot = -1;
+  for (int i = 0; i < MAX_STREAMS; i++)
+    if (!g_streams[i].used) { slot = i; break; }
+  if (slot < 0) return CUDA_ERROR_OUT_OF_MEMORY;
+  g_streams[slot].q = [g_device newCommandQueue];
+  g_streams[slot].last_cb = nil;
+  g_streams[slot].used = 1;
+  if (stream) *stream = (CUdeviceptr)(slot + 1);
   return CUDA_SUCCESS;
 }
-int cuStreamDestroy(CUdeviceptr stream) { slog("cuStreamDestroy", "stream=%llu", (unsigned long long)stream); return CUDA_SUCCESS; }
-int cuStreamSynchronize(CUdeviceptr stream) { slog("cuStreamSynchronize", "stream=%llu", (unsigned long long)stream); return CUDA_SUCCESS; }
+int cuStreamDestroy(CUdeviceptr stream) {
+  int i = (int)stream - 1;
+  if (i >= 0 && i < MAX_STREAMS && g_streams[i].used) {
+    g_streams[i].used = 0;
+    g_streams[i].q = nil;
+    g_streams[i].last_cb = nil;
+  }
+  slog("cuStreamDestroy", "stream=%llu", (unsigned long long)stream);
+  return CUDA_SUCCESS;
+}
+int cuStreamSynchronize(CUdeviceptr stream) {
+  int rc = CUDA_SUCCESS;
+  id<MTLCommandBuffer> *slot = last_cb_slot(stream);
+  if (slot && *slot) {
+    [*slot waitUntilCompleted];
+    if ((*slot).status != MTLCommandBufferStatusCompleted) {
+      slog("cuStreamSynchronize", "stream=%llu status %ld",
+           (unsigned long long)stream, (long)(*slot).status);
+      rc = CUDA_ERROR_NOT_SUPPORTED;
+    }
+    *slot = nil;
+  }
+  slog("cuStreamSynchronize", "stream=%llu", (unsigned long long)stream);
+  return rc;
+}
+
 int cuEventCreate(CUdeviceptr *event, unsigned flags) {
   slog("cuEventCreate", "flags=0x%x", flags);
-  if (event) *event = 3;
+  int slot = -1;
+  for (int i = 0; i < MAX_EVENTS; i++)
+    if (!g_events[i].used) { slot = i; break; }
+  if (slot < 0) return CUDA_ERROR_OUT_OF_MEMORY;
+  g_events[slot].used = 1;
+  g_events[slot].cb = nil;
+  if (event) *event = (CUdeviceptr)(slot + 1);
   return CUDA_SUCCESS;
 }
-int cuEventRecord(CUdeviceptr event, CUdeviceptr stream) { slog("cuEventRecord", ""); return CUDA_SUCCESS; }
-int cuEventSynchronize(CUdeviceptr event) { slog("cuEventSynchronize", ""); return CUDA_SUCCESS; }
-int cuEventDestroy(CUdeviceptr event) { slog("cuEventDestroy", ""); return CUDA_SUCCESS; }
+int cuEventRecord(CUdeviceptr event, CUdeviceptr stream) {
+  int ei = (int)event - 1;
+  if (ei < 0 || ei >= MAX_EVENTS || !g_events[ei].used) return CUDA_ERROR_INVALID_VALUE;
+  id<MTLCommandBuffer> *slot = last_cb_slot(stream);
+  g_events[ei].cb = slot ? *slot : nil;
+  slog("cuEventRecord", "event=%llu stream=%llu cb=%s",
+       (unsigned long long)event, (unsigned long long)stream, slot ? "bound" : "default");
+  return CUDA_SUCCESS;
+}
+int cuEventSynchronize(CUdeviceptr event) {
+  int ei = (int)event - 1;
+  if (ei < 0 || ei >= MAX_EVENTS || !g_events[ei].used) return CUDA_ERROR_INVALID_VALUE;
+  if (g_events[ei].cb) [g_events[ei].cb waitUntilCompleted];
+  slog("cuEventSynchronize", "event=%llu", (unsigned long long)event);
+  return CUDA_SUCCESS;
+}
+int cuEventDestroy(CUdeviceptr event) {
+  int ei = (int)event - 1;
+  if (ei >= 0 && ei < MAX_EVENTS) {
+    g_events[ei].used = 0;
+    g_events[ei].cb = nil;
+  }
+  slog("cuEventDestroy", "event=%llu", (unsigned long long)event);
+  return CUDA_SUCCESS;
+}
 float cuEventElapsedTime(CUdeviceptr start, CUdeviceptr end) {
-  slog("cuEventElapsedTime", "");
-  return 0.0f;
+  int si = (int)start - 1, ei = (int)end - 1;
+  float ms = 0.0f;
+  if (si >= 0 && si < MAX_EVENTS && ei >= 0 && ei < MAX_EVENTS &&
+      g_events[si].cb && g_events[ei].cb) {
+    id<MTLCommandBuffer> s = g_events[si].cb, e = g_events[ei].cb;
+    [s waitUntilCompleted];
+    [e waitUntilCompleted];
+    if (s.GPUEndTime > 0 && e.GPUStartTime > 0)
+      ms = (float)((e.GPUStartTime - s.GPUEndTime) * 1000.0);
+    slog("cuEventElapsedTime", "gpu ts: start_end=%f end_start=%f", s.GPUEndTime, e.GPUStartTime);
+  }
+  slog("cuEventElapsedTime", "start=%llu end=%llu -> %f ms",
+       (unsigned long long)start, (unsigned long long)end, ms);
+  return ms;
 }
 
 /* ---- module / kernel: v2 fatbin/raw-PTX → MSL → Metal dispatch ---------- */
@@ -448,7 +551,12 @@ int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsi
      .param list (u64 ambiguous). 'p': registry lookup → real MTLBuffer,
      else the raw 8 bytes. 'l'/'d': 8-byte scalar. 'u'/'i'/'f': exactly 4
      bytes (never reads past a 4-byte argument slot). */
-  id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+  id<MTLCommandQueue> q = queue_for(stream);
+  if (!q) {
+    slog("cuLaunchKernel", "invalid stream %llu", (unsigned long long)stream);
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  id<MTLCommandBuffer> cb = [q commandBuffer];
   id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
   [enc setComputePipelineState:pso];
   for (int bi = 0; params && params[bi] && bi < 16; bi++) {
@@ -484,6 +592,15 @@ int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsi
       threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
   [enc endEncoding];
   [cb commit];
+
+  /* Default stream: synchronous (wait + status check). Named streams:
+     async commit — cuStreamSynchronize owns the wait. */
+  id<MTLCommandBuffer> *slot = last_cb_slot(stream);
+  if (slot) {
+    *slot = cb;
+    slog("cuLaunchKernel", "committed async on %s", g_device.name.UTF8String);
+    return CUDA_SUCCESS;
+  }
   [cb waitUntilCompleted];
 
   if (cb.status != MTLCommandBufferStatusCompleted) {
