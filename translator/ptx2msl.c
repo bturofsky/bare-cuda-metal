@@ -26,6 +26,17 @@ static void clean_param_name(const char *mangled, char *out, size_t outsz) {
   else snprintf(out, outsz, "%s", mangled);
 }
 
+/* Clean a PTX label ($L__BB0_2:) into a legal MSL identifier (L__BB0_2) */
+static void label_clean(const char *tok, char *out, size_t outsz) {
+  size_t k = 0;
+  for (; *tok && k + 1 < outsz; tok++) {
+    if (*tok == '$' || *tok == '%' || *tok == '@') continue;
+    if (*tok == ':' || *tok == ';' || *tok == ',') break;
+    out[k++] = (isalnum((unsigned char)*tok) || *tok == '_') ? *tok : '_';
+  }
+  out[k] = 0;
+}
+
 /* Registers known to hold device pointers (ld.param.u64 / cvta chains) */
 static int is_ptr_reg(char regs[][32], int n, const char *r) {
   for (int i = 0; i < n; i++) if (!strcmp(regs[i], r)) return 1;
@@ -262,10 +273,12 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
     }
   }
 
-  /* Emit MSL header + kernel signature */
-  size_t pos = 0;
-  char *out = msl_buf;
-  #define EMIT(...) do { if (pos < msl_buf_sz - 1) pos += (size_t)snprintf(out + pos, msl_buf_sz - 1 - pos, __VA_ARGS__); } while(0)
+  /* Emit MSL header + kernel signature, then the body into a separate
+     buffer so declarations can be hoisted before assembly (goto must not
+     cross initializations in C++). */
+  char body_buf[12288];
+  size_t bpos = 0;
+  #define EMIT(...) do { if (bpos < sizeof body_buf - 1) bpos += (size_t)snprintf(body_buf + bpos, sizeof body_buf - 1 - bpos, __VA_ARGS__); } while(0)
 
   EMIT("#include <metal_stdlib>\nusing namespace metal;\n\n");
   EMIT("kernel void %s_msl(\n", kernel_name);
@@ -285,11 +298,61 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
   EMIT(",\n"
        "  uint _gid [[threadgroup_position_in_grid]],\n"
        "  uint _lid [[thread_position_in_threadgroup]],\n"
-       "  uint _lsz [[threads_per_threadgroup]]\n"
+       "  uint _lsz [[threads_per_threadgroup]],\n"
+       "  uint _ngid [[threadgroups_per_grid]]\n"
        ") {\n");
+  size_t header_len = bpos;
 
   char ptr_regs[64][32];
   int nptr_regs = 0;
+
+  /* MSL has no goto/labels. Control flow is translated to a program-counter
+     switch loop: each chunk of straight-line code between labels becomes a
+     case; branches assign _pc; ret sets -1. Exact for arbitrary PTX flow. */
+
+  /* Pass A: collect labels → chunk ids and count chunks. A chunk boundary
+     is created by a label AND by a branch instruction (the code after a
+     predicated branch is the fallthrough chunk). Chunk 0 = code before the
+     first boundary. */
+  char label_names[32][64];
+  int label_chunks[32];
+  int nlabels = 0;
+  int nchunks = 1;
+  {
+    char *p = body;
+    while (p < func_end) {
+      char *nl2 = strchr(p, '\n');
+      if (!nl2) nl2 = func_end;
+      size_t ll2 = (size_t)(nl2 - p);
+      if (ll2 < MAX_LINE) {
+        char l2[MAX_LINE];
+        memcpy(l2, p, ll2);
+        l2[ll2] = 0;
+        char *ls2 = l2;
+        while (*ls2 && isspace((unsigned char)*ls2)) ls2++;
+        int is_branch =
+            (strncmp(ls2, "bra", 3) == 0 && !isalnum((unsigned char)ls2[3])) ||
+            strstr(ls2, " bra ") != NULL;
+        if (*ls2 == '$') {
+          if (nlabels < 32) {
+            label_clean(ls2, label_names[nlabels], sizeof label_names[nlabels]);
+            nchunks++;
+            label_chunks[nlabels++] = nchunks - 1;
+          }
+        } else if (is_branch) {
+          nchunks++;
+        }
+      }
+      p = nl2 < func_end ? nl2 + 1 : func_end;
+    }
+  }
+  int cur_chunk = 0;
+  int chunk_closed = 0;
+
+  EMIT("  int _pc = 0;\n");
+  EMIT("  while (_pc >= 0) {\n");
+  EMIT("    switch (_pc) {\n");
+  EMIT("    case 0:\n");
 
   /* Process the body: extract one instruction at a time, translate */
   char *ip = body;
@@ -319,8 +382,21 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
     if (ls[0] == '.' || ls[0] == '}')
       continue;
 
-    /* Skip labels like $L__BB0_2: */
-    if (ls[0] == '$') continue;
+    /* Labels $L__BB0_2: close the current chunk and open the next case */
+    if (ls[0] == '$') {
+      char ln[64];
+      label_clean(ls, ln, sizeof ln);
+      if (!ln[0]) continue;
+      if (!chunk_closed) {
+        EMIT("      _pc = %d;\n      break;\n",
+             cur_chunk + 1 <= nchunks - 1 ? cur_chunk + 1 : -1);
+        chunk_closed = 1;
+      }
+      cur_chunk++;
+      EMIT("    case %d:\n", cur_chunk);
+      chunk_closed = 0;
+      continue;
+    }
 
     /* Tokenize the instruction: opcode then operands, comma-separated */
     char toks[8][128];
@@ -367,7 +443,10 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
 
     /* mov.u32 %r3, %ctaid.x; → CUDA thread coordinates as MSL builtins */
     if (ntoks >= 3 && !strcmp(op, "mov.u32")) {
-      if (strstr(toks[2], "ctaid"))
+      /* check nctaid first: "nctaid" contains "ctaid" */
+      if (strstr(toks[2], "nctaid"))
+        EMIT("  uint %s = _ngid;\n", toks[1]);
+      else if (strstr(toks[2], "ctaid"))
         EMIT("  uint %s = _gid;\n", toks[1]);
       else if (strstr(toks[2], "ntid"))
         EMIT("  uint %s = _lsz;\n", toks[1]);
@@ -400,6 +479,18 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
       continue;
     }
 
+    /* mul.lo.s32 %r, %r, %r; → int multiply */
+    if (strstr(op, "mul.lo")) {
+      if (ntoks >= 4) EMIT("  int %s = %s * %s;\n", toks[1], toks[2], toks[3]);
+      continue;
+    }
+
+    /* add.s32 / add.u32 — the grid-stride loop increment */
+    if (strstr(op, "add.s32") || strstr(op, "add.u32")) {
+      if (ntoks >= 4) EMIT("  int %s = %s + %s;\n", toks[1], toks[2], toks[3]);
+      continue;
+    }
+
     /* setp.ge.s32 %p1, %r1, %r2; → comparison */
     if (strstr(op, "setp.ge")) {
       if (ntoks >= 4) EMIT("  bool %s = (%s >= %s);\n", toks[1], toks[2], toks[3]);
@@ -426,17 +517,54 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
       continue;
     }
 
-    /* @%p1 bra LABEL; → conditional return (the bounds-check pattern) */
-    if (ntoks >= 2 && !strcmp(toks[1], "bra")) {
-      EMIT("  if (%s) return;\n", toks[0]);
+    /* @%p bra LABEL; → predicated _pc transition */
+    if (ntoks >= 3 && !strcmp(toks[1], "bra")) {
+      char ln[64];
+      label_clean(toks[2], ln, sizeof ln);
+      int tc = -1;
+      for (int i = 0; i < nlabels; i++)
+        if (strcmp(label_names[i], ln) == 0) { tc = label_chunks[i]; break; }
+      if (!ln[0] || tc < 0) {
+        snprintf(err_buf, err_sz, "branch to unknown label '%s'",
+                 ln[0] ? ln : toks[2]);
+        free(text);
+        return -1;
+      }
+      EMIT("      _pc = %s ? %d : %d;\n      break;\n",
+           toks[0], tc, cur_chunk + 1 <= nchunks - 1 ? cur_chunk + 1 : -1);
+      /* the fallthrough code after the branch is a new chunk */
+      cur_chunk++;
+      EMIT("    case %d:\n", cur_chunk);
+      continue;
+    }
+
+    /* bra.uni LABEL; → unconditional _pc transition */
+    if ((!strcmp(op, "bra.uni") || !strcmp(op, "bra")) && ntoks >= 2) {
+      char ln[64];
+      label_clean(toks[1], ln, sizeof ln);
+      int tc = -1;
+      for (int i = 0; i < nlabels; i++)
+        if (strcmp(label_names[i], ln) == 0) { tc = label_chunks[i]; break; }
+      if (!ln[0] || tc < 0) {
+        snprintf(err_buf, err_sz, "branch to unknown label '%s'",
+                 ln[0] ? ln : toks[1]);
+        free(text);
+        return -1;
+      }
+      EMIT("      _pc = %d;\n      break;\n", tc);
+      /* the code after an unconditional branch is unreachable; open the next
+         chunk anyway so labels/ret line up with pass A's numbering */
+      cur_chunk++;
+      EMIT("    case %d:\n", cur_chunk);
       continue;
     }
 
     /* ld.global.f32 %f1, [%rd8+4]; → device-space load. */
     if (strstr(op, "ld.global")) {
       if (!strstr(op, ".f32")) { /* only f32 loads in the measured subset */
-        EMIT("  /* unsupported load: %s */\n", op);
-        continue;
+        snprintf(err_buf, err_sz, "unsupported load type '%s'", op);
+        free(text);
+        return -1;
       }
       /* toks[1] = destination register
          toks[2] = address expression like rd8+4 or just rd8 */
@@ -520,7 +648,8 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
 
     /* ret */
     if (!strcmp(op, "ret")) {
-      EMIT("  return;\n");
+      EMIT("      _pc = -1;\n      break;\n");
+      chunk_closed = 1;
       continue;
     }
 
@@ -531,13 +660,102 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
     return -1;
   }
 
-  EMIT("}\n");
+  /* close the final chunk, then the switch and the dispatch loop */
+  if (!chunk_closed) {
+    EMIT("      _pc = %d;\n      break;\n",
+         cur_chunk + 1 <= nchunks - 1 ? cur_chunk + 1 : -1);
+  }
+  EMIT("    }\n"); /* switch */
+  EMIT("  }\n");   /* while (_pc >= 0) */
 
-  if (pos >= msl_buf_sz - 1) {
+  /* ---- assembly: hoist every declaration above the body so the dispatch
+     cases share one scope (C++ forbids jumping over initialized decls),
+     then append the processed body ---- */
+  static const char *ktypes[] = {
+      "device const void *", "device const char *",
+      "uint", "int", "long", "bool", "float", "double"};
+  const int nktypes = (int)(sizeof ktypes / sizeof ktypes[0]);
+  char hoist[6144];
+  size_t hpos = 0;
+  char seen[128][24];
+  int nseen = 0;
+  char fbody[12288];
+  size_t fpos = 0;
+  char *s = body_buf + header_len;
+  while (s < body_buf + bpos) {
+    char *nl = strchr(s, '\n');
+    if (!nl) nl = body_buf + bpos;
+    size_t ll = (size_t)(nl - s);
+    if (ll == 0 || ll >= MAX_LINE) {
+      s = nl < body_buf + bpos ? nl + 1 : body_buf + bpos;
+      continue;
+    }
+    char line[MAX_LINE];
+    memcpy(line, s, ll);
+    line[ll] = 0;
+    s = nl < body_buf + bpos ? nl + 1 : body_buf + bpos;
+
+    /* try to parse "  <type> <name> = <rhs>;" (a declaration with init) */
+    char *t = line;
+    while (*t == ' ') t++;
+    const char *ty = NULL;
+    size_t tyl = 0;
+    for (int i = 0; i < nktypes && !ty; i++) {
+      size_t kl = strlen(ktypes[i]);
+      if (strncmp(t, ktypes[i], kl) == 0 && (t[kl] == ' ' || ktypes[i][kl - 1] == '*')) {
+        ty = ktypes[i];
+        tyl = kl;
+      }
+    }
+    char name[24] = "";
+    const char *rhs = NULL;
+    size_t nlen = 0;
+    if (ty) {
+      const char *np = t + tyl;
+      while (*np == ' ') np++;
+      const char *ns = np;
+      while (*np && (isalnum((unsigned char)*np) || *np == '_')) np++;
+      nlen = (size_t)(np - ns);
+      if (nlen > 0 && nlen < sizeof name && np[0] == ' ' && np[1] == '=' && np[2] == ' ') {
+        memcpy(name, ns, nlen);
+        name[nlen] = 0;
+        rhs = np + 3;
+      }
+    }
+    if (rhs) {
+      int seen_before = 0;
+      for (int i = 0; i < nseen; i++)
+        if (strcmp(seen[i], name) == 0) { seen_before = 1; break; }
+      if (!seen_before && nseen < 128) {
+        snprintf(seen[nseen++], sizeof seen[0], "%s", name);
+        if (hpos + tyl + nlen + 16 < sizeof hoist)
+          hpos += (size_t)snprintf(hoist + hpos, sizeof hoist - 1 - hpos,
+                                   "  %.*s %s;\n", (int)tyl, ty, name);
+      }
+      if (fpos + nlen + strlen(rhs) + 8 < sizeof fbody)
+        fpos += (size_t)snprintf(fbody + fpos, sizeof fbody - 1 - fpos,
+                                 "  %s = %s\n", name, rhs);
+    } else if (fpos + ll + 2 < sizeof fbody) {
+      memcpy(fbody + fpos, line, ll);
+      fpos += ll;
+      fbody[fpos++] = '\n';
+      fbody[fpos] = 0;
+    }
+  }
+
+  size_t need = header_len + hpos + fpos + 4;
+  if (need > msl_buf_sz - 1 || bpos >= sizeof body_buf - 1 ||
+      hpos >= sizeof hoist - 1 || fpos >= sizeof fbody - 1) {
     snprintf(err_buf, err_sz, "MSL output truncated");
     free(text);
     return -1;
   }
+  memcpy(msl_buf, body_buf, header_len);
+  memcpy(msl_buf + header_len, hoist, hpos);
+  memcpy(msl_buf + header_len + hpos, fbody, fpos);
+  msl_buf[header_len + hpos + fpos] = '}';
+  msl_buf[header_len + hpos + fpos + 1] = '\n';
+  msl_buf[header_len + hpos + fpos + 2] = 0;
   free(text);
   return 0;
 }

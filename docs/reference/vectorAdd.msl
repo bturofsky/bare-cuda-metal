@@ -9,28 +9,61 @@ kernel void _Z9vectorAddPKfS0_Pfi_msl(
 ,
   uint _gid [[threadgroup_position_in_grid]],
   uint _lid [[thread_position_in_threadgroup]],
-  uint _lsz [[threads_per_threadgroup]]
+  uint _lsz [[threads_per_threadgroup]],
+  uint _ngid [[threadgroups_per_grid]]
 ) {
-  device const void *rd1 = param_0;
-  device const void *rd2 = param_1;
-  device const void *rd3 = param_2;
-  uint r2 = param_3;
-  uint r3 = _gid;
-  uint r4 = _lsz;
-  uint r5 = _lid;
-  int r1 = r3 * r4 + r5;
-  bool p1 = (r1 >= r2);
-  if (p1) return;
-  device const void *rd4 = rd1;
-  long rd5 = (long)r1 * (long)4;
-  device const char *rd6 = (device const char *)rd4 + (long)rd5;
-  device const void *rd7 = rd2;
-  device const char *rd8 = (device const char *)rd7 + (long)rd5;
-  float f1 = *(device const float *)((device const char *)rd8 + 0);
-  float f2 = *(device const float *)((device const char *)rd6 + 0);
-  float f3 = f2 + f1;
-  device const void *rd9 = rd3;
-  device const char *rd10 = (device const char *)rd9 + (long)rd5;
+  int _pc;
+  device const void * rd1;
+  device const void * rd2;
+  device const void * rd3;
+  uint r2;
+  uint r3;
+  uint r4;
+  uint r5;
+  int r1;
+  bool p1;
+  device const void * rd4;
+  long rd5;
+  device const char * rd6;
+  device const void * rd7;
+  device const char * rd8;
+  float f1;
+  float f2;
+  float f3;
+  device const void * rd9;
+  device const char * rd10;
+  _pc = 0;
+  while (_pc >= 0) {
+    switch (_pc) {
+    case 0:
+  rd1 = param_0;
+  rd2 = param_1;
+  rd3 = param_2;
+  r2 = param_3;
+  r3 = _gid;
+  r4 = _lsz;
+  r5 = _lid;
+  r1 = r3 * r4 + r5;
+  p1 = (r1 >= r2);
+      _pc = p1 ? 2 : 1;
+      break;
+    case 1:
+  rd4 = rd1;
+  rd5 = (long)r1 * (long)4;
+  rd6 = (device const char *)rd4 + (long)rd5;
+  rd7 = rd2;
+  rd8 = (device const char *)rd7 + (long)rd5;
+  f1 = *(device const float *)((device const char *)rd8 + 0);
+  f2 = *(device const float *)((device const char *)rd6 + 0);
+  f3 = f2 + f1;
+  rd9 = rd3;
+  rd10 = (device const char *)rd9 + (long)rd5;
   *(device float *)((device char *)rd10 + 0) = f3;
-  return;
+      _pc = 2;
+      break;
+    case 2:
+      _pc = -1;
+      break;
+    }
+  }
 }

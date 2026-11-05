@@ -5,7 +5,7 @@ CC = clang
 CFLAGS = -O2 -Wall -Wextra -dynamiclib
 SHIM = shim/libcuda_shim.dylib
 
-all: $(SHIM) test_run scan/scan gemm_ab v2_launch v2_fatbin v2_multi
+all: $(SHIM) test_run scan/scan gemm_ab v2_launch v2_fatbin v2_multi v2_loop
 
 CUBLAS_SHIM = shim/libcublas_shim.dylib
 $(CUBLAS_SHIM): shim/libcublas_shim.m
@@ -32,10 +32,13 @@ v2_fatbin: $(SHIM) test/v2_fatbin.c
 v2_multi: $(SHIM) test/v2_multi.c
 	$(CC) -O2 -Wall -o $@ test/v2_multi.c $(SHIM)
 
+v2_loop: $(SHIM) test/v2_loop.c
+	$(CC) -O2 -Wall -o $@ test/v2_loop.c $(SHIM)
+
 scan/scan: scan/scan.c scan/zstd_decomp.c
 	$(CC) -O2 -Wall -DHAVE_ZSTD -I/opt/homebrew/include -o $@ scan/scan.c scan/zstd_decomp.c scan/lz4_block.c -lz -L/opt/homebrew/lib -lzstd -L/opt/homebrew/opt/lz4/lib -llz4
 
 clean:
-	rm -f $(SHIM) test/test_harness v2_launch v2_fatbin v2_multi
+	rm -f $(SHIM) test/test_harness v2_launch v2_fatbin v2_multi v2_loop
 
 .PHONY: all test_run clean
