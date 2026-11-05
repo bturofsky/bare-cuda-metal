@@ -19,6 +19,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <zlib.h>
+#include <zstd.h>
 
 extern int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
                                 const char *kernel_name,
@@ -122,9 +123,8 @@ static unsigned char *lz4_decomp(const unsigned char *in, size_t inlen,
   return out;
 }
 
-/* ---- ZSTD decompress (via libzstd if available, else skip) ---------------- */
-/* v3.2: zstd handled by the caller; this function just passes through for
-   now since PyTorch-class binaries use lz4. */
+/* ---- ZSTD decompress (libzstd; frames as produced by the zstd CLI and by
+   CUDA toolkits ≥ 12.8 fatbinary --compress-method zstd) ------------------- */
 
 /* ---- fatbin PTX extraction ----------------------------------------------- */
 /* Scans the fatbin at `data` for PTX entries and returns the first PTX text
@@ -151,13 +151,13 @@ static char *extract_ptx(const void *data, size_t data_size, size_t *ptx_len) {
           if (fe.kind == FATBIN_PTX) {
             const unsigned char *ptx_payload = bytes + p + fe.header_size;
             size_t plen = fe.payload_size;
+            /* tighter input bound shared by the compressed branches: the rest
+               of the payload may be an uncompressed footer */
+            size_t cin = (fe.compressed_size && fe.compressed_size < plen)
+                             ? fe.compressed_size : plen;
             /* Handle compression */
             if (fe.flags & FFLAG_LZ4) {
               size_t dec_len = 0;
-              /* compressed_size is the tighter input bound; the rest of the
-                 payload may be an uncompressed footer */
-              size_t cin = (fe.compressed_size && fe.compressed_size < plen)
-                               ? fe.compressed_size : plen;
               unsigned char *dec = lz4_decomp(ptx_payload, cin,
                                               (size_t)fe.uncompressed_payload, &dec_len);
               if (dec) {
@@ -168,6 +168,21 @@ static char *extract_ptx(const void *data, size_t data_size, size_t *ptx_len) {
                 *ptx_len = dec_len;
                 return result;
               }
+            } else if (fe.flags & FFLAG_ZSTD) {
+              size_t cap = fe.uncompressed_payload
+                               ? (size_t)fe.uncompressed_payload + 64
+                               : plen * 8 + 1024;
+              unsigned char *dec = malloc(cap);
+              size_t zr = ZSTD_decompress(dec, cap, ptx_payload, cin);
+              if (!ZSTD_isError(zr)) {
+                char *result = malloc(zr + 1);
+                memcpy(result, dec, zr);
+                result[zr] = 0;
+                free(dec);
+                *ptx_len = zr;
+                return result;
+              }
+              free(dec);
             } else if (fe.flags & 0x1000) { /* deflate */
               uLongf cap = fe.uncompressed_payload + 65536;
               unsigned char *dec = malloc(cap);

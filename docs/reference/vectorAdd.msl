@@ -1,6 +1,32 @@
 #include <metal_stdlib>
+#include <metal_atomic>
 using namespace metal;
 
+static float _shfl_up(float a, uint bval, uint cval, uint lane) {
+  bval &= 31u; uint mask = (cval >> 8u) & 31u; uint clamp = cval & 31u;
+  uint maxLane = (lane & mask) | (clamp & ~mask);
+  uint j = lane - bval; if (!(j >= maxLane)) j = lane;
+  return simd_shuffle(a, j);
+}
+static float _shfl_down(float a, uint bval, uint cval, uint lane) {
+  bval &= 31u; uint mask = (cval >> 8u) & 31u; uint clamp = cval & 31u;
+  uint maxLane = (lane & mask) | (clamp & ~mask);
+  uint j = lane + bval; if (!(j <= maxLane)) j = lane;
+  return simd_shuffle(a, j);
+}
+static float _shfl_bfly(float a, uint bval, uint cval, uint lane) {
+  bval &= 31u; uint mask = (cval >> 8u) & 31u; uint clamp = cval & 31u;
+  uint maxLane = (lane & mask) | (clamp & ~mask);
+  uint j = lane ^ bval; if (!(j <= maxLane)) j = lane;
+  return simd_shuffle(a, j);
+}
+static float _shfl_idx(float a, uint bval, uint cval, uint lane) {
+  bval &= 31u; uint mask = (cval >> 8u) & 31u; uint clamp = cval & 31u;
+  uint minLane = lane & mask;
+  uint maxLane = (lane & mask) | (clamp & ~mask);
+  uint j = minLane | (bval & ~mask); if (!(j <= maxLane)) j = lane;
+  return simd_shuffle(a, j);
+}
 kernel void _Z9vectorAddPKfS0_Pfi_msl(
   device float *param_0 [[buffer(0)]],
   device float *param_1 [[buffer(1)]],

@@ -1,0 +1,104 @@
+.version 8.4
+.target sm_86
+.address_size 64
+.visible .entry _Z7warpSumPfS_i(
+.param .u64 _Z7warpSumPfS_i_param_0,
+.param .u64 _Z7warpSumPfS_i_param_1,
+.param .u32 _Z7warpSumPfS_i_param_2
+)
+{
+.reg .b32 %r<8>;
+.reg .b64 %rd<9>;
+.reg .f32 %f<3>;
+ld.param.u64 %rd1, [_Z7warpSumPfS_i_param_0];
+ld.param.u64 %rd2, [_Z7warpSumPfS_i_param_1];
+ld.param.u32 %r2, [_Z7warpSumPfS_i_param_2];
+mov.u32 %r3, %ctaid.x;
+mov.u32 %r4, %ntid.x;
+mov.u32 %r5, %tid.x;
+mad.lo.s32 %r1, %r3, %r4, %r5;
+cvta.to.global.u64 %rd3, %rd2;
+mul.wide.s32 %rd4, %r1, 4;
+add.s64 %rd5, %rd3, %rd4;
+ld.global.f32 %f1, [%rd5];
+shfl.bfly.b32 %f2, %f1, 16, 31;
+add.f32 %f1, %f1, %f2;
+shfl.bfly.b32 %f2, %f1, 8, 31;
+add.f32 %f1, %f1, %f2;
+shfl.bfly.b32 %f2, %f1, 4, 31;
+add.f32 %f1, %f1, %f2;
+shfl.bfly.b32 %f2, %f1, 2, 31;
+add.f32 %f1, %f1, %f2;
+shfl.bfly.b32 %f2, %f1, 1, 31;
+add.f32 %f1, %f1, %f2;
+cvta.to.global.u64 %rd6, %rd1;
+mul.wide.s32 %rd7, %r1, 4;
+add.s64 %rd8, %rd6, %rd7;
+st.global.f32 [%rd8], %f1;
+ret;
+}
+.visible .entry _Z8warpScanPfS_i(
+.param .u64 _Z8warpScanPfS_i_param_0,
+.param .u64 _Z8warpScanPfS_i_param_1,
+.param .u32 _Z8warpScanPfS_i_param_2
+)
+{
+.reg .pred %p<2>;
+.reg .b32 %r<8>;
+.reg .b64 %rd<9>;
+.reg .f32 %f<3>;
+ld.param.u64 %rd1, [_Z8warpScanPfS_i_param_0];
+ld.param.u64 %rd2, [_Z8warpScanPfS_i_param_1];
+ld.param.u32 %r2, [_Z8warpScanPfS_i_param_2];
+mov.u32 %r3, %ctaid.x;
+mov.u32 %r4, %ntid.x;
+mov.u32 %r5, %tid.x;
+mad.lo.s32 %r1, %r3, %r4, %r5;
+cvta.to.global.u64 %rd3, %rd2;
+mul.wide.s32 %rd4, %r1, 4;
+add.s64 %rd5, %rd3, %rd4;
+ld.global.f32 %f1, [%rd5];
+shfl.up.b32 %f2|%p1, %f1, 1, 0;
+@%p1 add.f32 %f1, %f1, %f2;
+shfl.up.b32 %f2|%p1, %f1, 2, 0;
+@%p1 add.f32 %f1, %f1, %f2;
+shfl.up.b32 %f2|%p1, %f1, 4, 0;
+@%p1 add.f32 %f1, %f1, %f2;
+shfl.up.b32 %f2|%p1, %f1, 8, 0;
+@%p1 add.f32 %f1, %f1, %f2;
+shfl.up.b32 %f2|%p1, %f1, 16, 0;
+@%p1 add.f32 %f1, %f1, %f2;
+cvta.to.global.u64 %rd6, %rd1;
+mul.wide.s32 %rd7, %r1, 4;
+add.s64 %rd8, %rd6, %rd7;
+st.global.f32 [%rd8], %f1;
+ret;
+}
+.visible .entry _Z7sel64OffPfS_i(
+.param .u64 _Z7sel64OffPfS_i_param_0,
+.param .u64 _Z7sel64OffPfS_i_param_1,
+.param .u32 _Z7sel64OffPfS_i_param_2
+)
+{
+.reg .pred %p<2>;
+.reg .b32 %r<8>;
+.reg .b64 %rd<11>;
+.reg .f32 %f<2>;
+ld.param.u64 %rd1, [_Z7sel64OffPfS_i_param_0];
+ld.param.u64 %rd2, [_Z7sel64OffPfS_i_param_1];
+ld.param.u32 %r2, [_Z7sel64OffPfS_i_param_2];
+mov.u32 %r3, %ctaid.x;
+mov.u32 %r4, %ntid.x;
+mov.u32 %r5, %tid.x;
+mad.lo.s32 %r1, %r3, %r4, %r5;
+setp.ge.s32 %p1, %r1, %r2;
+selp.u64 %rd3, 16, 32, %p1;
+cvta.to.global.u64 %rd4, %rd2;
+add.s64 %rd5, %rd4, %rd3;
+ld.global.f32 %f1, [%rd5];
+cvta.to.global.u64 %rd6, %rd1;
+mul.wide.s32 %rd7, %r1, 4;
+add.s64 %rd8, %rd6, %rd7;
+st.global.f32 [%rd8], %f1;
+ret;
+}

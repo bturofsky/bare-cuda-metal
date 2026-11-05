@@ -297,6 +297,51 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
   #define EMIT(...) do { if (bpos < sizeof body_buf - 1) bpos += (size_t)snprintf(body_buf + bpos, sizeof body_buf - 1 - bpos, __VA_ARGS__); } while(0)
 
   EMIT("#include <metal_stdlib>\n#include <metal_atomic>\nusing namespace metal;\n\n");
+  /* PTX ISA shfl arithmetic, verbatim (docs.nvidia.com/cuda/parallel-thread-execution):
+     lane[4:0]=laneid; bval=b[4:0]; cval=c[4:0]; mask=c[12:8];
+     maxLane=(lane&mask)|(cval&~mask); minLane=(lane&mask);
+     up:   j=lane-bval; p=(j>=maxLane)
+     down: j=lane+bval; p=(j<=maxLane)
+     bfly: j=lane^bval; p=(j<=maxLane)
+     idx:  j=minLane|(bval&~mask); p=(j<=maxLane)
+     if(!p) j=lane;  d = SourceA[j];  */
+  EMIT("static float _shfl_up_p(float a, uint bval, uint cval, uint lane, thread bool *p) {\n"
+       "  bval &= 31u; uint mask = (cval >> 8u) & 31u; uint clamp = cval & 31u;\n"
+       "  uint maxLane = (lane & mask) | (clamp & ~mask);\n"
+       "  int j = (int)lane - (int)bval; bool ok = (j >= (int)maxLane); if (!ok) j = (int)lane;\n"
+       "  *p = ok; return simd_shuffle(a, (uint)j);\n"
+       "}\n");
+  EMIT("static float _shfl_up(float a, uint bval, uint cval, uint lane) {\n"
+       "  bool p; return _shfl_up_p(a, bval, cval, lane, &p);\n"
+       "}\n");
+  EMIT("static float _shfl_down_p(float a, uint bval, uint cval, uint lane, thread bool *p) {\n"
+       "  bval &= 31u; uint mask = (cval >> 8u) & 31u; uint clamp = cval & 31u;\n"
+       "  uint maxLane = (lane & mask) | (clamp & ~mask);\n"
+       "  int j = (int)lane + (int)bval; bool ok = (j <= (int)maxLane); if (!ok) j = (int)lane;\n"
+       "  *p = ok; return simd_shuffle(a, (uint)j);\n"
+       "}\n");
+  EMIT("static float _shfl_down(float a, uint bval, uint cval, uint lane) {\n"
+       "  bool p; return _shfl_down_p(a, bval, cval, lane, &p);\n"
+       "}\n");
+  EMIT("static float _shfl_bfly_p(float a, uint bval, uint cval, uint lane, thread bool *p) {\n"
+       "  bval &= 31u; uint mask = (cval >> 8u) & 31u; uint clamp = cval & 31u;\n"
+       "  uint maxLane = (lane & mask) | (clamp & ~mask);\n"
+       "  int j = (int)(lane ^ bval); bool ok = (j <= (int)maxLane); if (!ok) j = (int)lane;\n"
+       "  *p = ok; return simd_shuffle(a, (uint)j);\n"
+       "}\n");
+  EMIT("static float _shfl_bfly(float a, uint bval, uint cval, uint lane) {\n"
+       "  bool p; return _shfl_bfly_p(a, bval, cval, lane, &p);\n"
+       "}\n");
+  EMIT("static float _shfl_idx_p(float a, uint bval, uint cval, uint lane, thread bool *p) {\n"
+       "  bval &= 31u; uint mask = (cval >> 8u) & 31u; uint clamp = cval & 31u;\n"
+       "  uint minLane = lane & mask;\n"
+       "  uint maxLane = (lane & mask) | (clamp & ~mask);\n"
+       "  int j = (int)(minLane | (bval & ~mask)); bool ok = (j <= (int)maxLane); if (!ok) j = (int)lane;\n"
+       "  *p = ok; return simd_shuffle(a, (uint)j);\n"
+       "}\n");
+  EMIT("static float _shfl_idx(float a, uint bval, uint cval, uint lane) {\n"
+       "  bool p; return _shfl_idx_p(a, bval, cval, lane, &p);\n"
+       "}\n");
   EMIT("kernel void %s_msl(\n", kernel_name);
   for (int i = 0; i < nkparams; i++) {
     if (kparams[i].is_ptr) {
@@ -323,6 +368,8 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
   int nptr_regs = 0;
   char sh_ptr_regs[64][32];
   int nsh_ptr = 0;
+  char pred_decls[16][16];
+  int npred_decls = 0;
 
   /* MSL has no goto/labels. Control flow is translated to a program-counter
      switch loop: each chunk of straight-line code between labels becomes a
@@ -337,8 +384,10 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
   int nlabels = 0;
   int nchunks = 1;
   char sh_names[8][64];
+  int sh_offsets[8];
   int sh_sizes[8];
   int nshared = 0;
+  int sh_total = 0;
   char sdecls[2048];
   size_t spos = 0;
   {
@@ -357,7 +406,8 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
             (strncmp(ls2, "bra", 3) == 0 && !isalnum((unsigned char)ls2[3])) ||
             strstr(ls2, " bra ") != NULL;
         if (strncmp(ls2, ".shared", 7) == 0 && nshared < 8) {
-          /* .shared .align 4 .b8 name[size]; → threadgroup array */
+          /* .shared .align 4 .b8 name[size]; → per-var base into a pooled
+             threadgroup allocation (16-byte aligned offsets) */
           const char *br = strchr(ls2, '[');
           const char *brk = br ? strchr(br, ']') : NULL;
           if (br && brk) {
@@ -374,14 +424,15 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
               nm[nm_len] = 0;
               char cnm[64];
               label_clean(nm, cnm, sizeof cnm);
-              if (cnm[0] && spos + nm_len + 48 < sizeof sdecls) {
+              if (cnm[0]) {
                 int elems = (atoi(br + 1) + 3) / 4;
                 if (elems < 1) elems = 1;
+                int off = (sh_total + 15) & ~15;
                 snprintf(sh_names[nshared], sizeof sh_names[0], "%s", cnm);
+                sh_offsets[nshared] = off;
                 sh_sizes[nshared] = elems * 4;
+                sh_total = off + elems * 4;
                 nshared++;
-                spos += (size_t)snprintf(sdecls + spos, sizeof sdecls - 1 - spos,
-                                         "  threadgroup float %s[%d];\n", cnm, elems);
               }
             }
           }
@@ -400,6 +451,16 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
   }
   int cur_chunk = 0;
   int chunk_closed = 0;
+
+  /* pooled threadgroup allocation: one array, per-var base pointers */
+  if (nshared > 0) {
+    spos += (size_t)snprintf(sdecls + spos, sizeof sdecls - 1 - spos,
+                             "  threadgroup float _shpool[%d];\n", (sh_total + 3) / 4);
+    for (int i = 0; i < nshared; i++)
+      spos += (size_t)snprintf(sdecls + spos, sizeof sdecls - 1 - spos,
+                               "  threadgroup float *%s = (threadgroup float *)((threadgroup char *)_shpool + %d);\n",
+                               sh_names[i], sh_offsets[i]);
+  }
 
   EMIT("  int _pc = 0;\n");
   EMIT("  while (_pc >= 0) {\n");
@@ -596,13 +657,15 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
       continue;
     }
 
-    /* selp.<type> d, a, b, c; → d = c ? a : b (float/int; operands may be
-       0f<8hex> immediates) */
+    /* selp.<type> d, a, b, c; → d = c ? a : b. All PTX widths: float/double
+       (0f immediates), s/u/b 16-bit → int, s/u/b 32-bit → int, s/u/b 64-bit → long. */
     if (op_is(op, "selp")) {
       if (ntoks >= 5) {
         const char *ts = op_is(op, "selp.f32") ? "float"
                          : op_is(op, "selp.f64") ? "double"
-                         : op_is(op, "selp.s32") ? "int" : "int";
+                         : (op_is(op, "selp.s64") || op_is(op, "selp.u64") ||
+                            op_is(op, "selp.b64")) ? "long"
+                         : "int";
         char va[96], vb[96];
         ptx_val(toks[2], va, sizeof va);
         ptx_val(toks[3], vb, sizeof vb);
@@ -611,25 +674,71 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
       continue;
     }
 
-    /* shfl.sync.<mode>.b32 d, a, b, c; → warp shuffles. PTX warp (32 lanes)
-       = MSL simdgroup exactly. b32 bit-pattern semantics: the measured
-       subset shuffles float values; mode maps: idx→simd_shuffle,
-       up/down→simd_shuffle_up/down, xor/bfly→simd_shuffle_xor. The clamp
-       operand (c, typically 31) is implied by the simdgroup. */
+    /* shfl[.sync].<mode>.b32 d[|p], a, b, c[, membermask]; → ISA-exact helpers
+       above. membermask ignored: MSL simd ops are warp-synchronizing (CUDA
+       leaves mismatched-mask behavior undefined). The d|p predicate
+       destination emits the in-range flag for @p-guarded consumers. */
     if (op_is(op, "shfl")) {
       const char *fn = NULL;
-      if (strstr(op, ".idx")) fn = "simd_shuffle";
-      else if (strstr(op, ".up")) fn = "simd_shuffle_up";
-      else if (strstr(op, ".down")) fn = "simd_shuffle_down";
-      else if (strstr(op, ".xor") || strstr(op, ".bfly") || strstr(op, ".fly"))
-        fn = "simd_shuffle_xor";
+      if (strstr(op, ".up")) fn = "_shfl_up";
+      else if (strstr(op, ".down")) fn = "_shfl_down";
+      else if (strstr(op, ".bfly") || strstr(op, ".xor") || strstr(op, ".fly"))
+        fn = "_shfl_bfly";
+      else if (strstr(op, ".idx")) fn = "_shfl_idx";
       if (!fn) {
         snprintf(err_buf, err_sz, "unsupported shuffle mode '%s'", op);
         free(text);
         return -1;
       }
-      if (ntoks >= 5) EMIT("  float %s = %s(%s, %s);\n", toks[1], fn, toks[2], toks[3]);
+      if (ntoks >= 5) {
+        char dest[64];
+        const char *pred = NULL;
+        snprintf(dest, sizeof dest, "%s", toks[1]);
+        char *bar = strchr(dest, '|');
+        if (bar) { *bar = 0; pred = bar + 1; }
+        if (pred && pred[0]) {
+          int seen = 0;
+          for (int i = 0; i < npred_decls; i++)
+            if (strcmp(pred_decls[i], pred) == 0) { seen = 1; break; }
+          if (!seen && npred_decls < 16) {
+            snprintf(pred_decls[npred_decls++], sizeof pred_decls[0], "%s", pred);
+            EMIT("  bool %s;\n", pred); /* vacuous decl — safe across cases */
+          }
+          EMIT("  float %s = %s_p(%s, %s, %s, (uint)(_lid & 31u), &%s);\n",
+               dest, fn, toks[2], toks[3], toks[4], pred);
+        } else {
+          EMIT("  float %s = %s(%s, %s, %s, (uint)(_lid & 31u));\n",
+               dest, fn, toks[2], toks[3], toks[4]);
+        }
+      }
       continue;
+    }
+
+    /* @%p1 add/sub/mul/fma (predicated float arithmetic — the ISA shuffle
+       scan/reduction idiom). Fires only when toks[0] is a bare pN register. */
+    if (ntoks >= 5) {
+      int is_pred = toks[0][0] == 'p' && isdigit((unsigned char)toks[0][1]);
+      for (const char *c = toks[0] + 1; is_pred && *c; c++)
+        if (!isdigit((unsigned char)*c)) is_pred = 0;
+      if (is_pred) {
+        const char *iop = toks[1];
+        const char *opc = op_is(iop, "add.f32") ? "+"
+                        : op_is(iop, "sub.f32") ? "-"
+                        : op_is(iop, "mul.f32") ? "*"
+                        : NULL;
+        if (opc) {
+          /* bare assignment: the destination was defined earlier (PTX
+             discipline); a declaration here would shadow the outer register */
+          EMIT("  if (%s) {\n    %s = %s %s %s;\n  }\n",
+               toks[0], toks[2], toks[3], opc, toks[4]);
+          continue;
+        }
+        if (op_is(iop, "fma.rn.f32") && ntoks >= 6) {
+          EMIT("  if (%s) {\n    %s = fma(%s, %s, %s);\n  }\n",
+               toks[0], toks[2], toks[3], toks[4], toks[5]);
+          continue;
+        }
+      }
     }
 
     /* bar.sync 0; → threadgroup barrier */
