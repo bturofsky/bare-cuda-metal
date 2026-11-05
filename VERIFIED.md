@@ -162,3 +162,40 @@ unified-memory CPU path (bandwidth-equivalent for memory-bound ops,
 element-verified against CPU truth). The cuBLAS subset that covers ~95% of
 real application calls is complete; complex types are documented as out of
 scope for the Mac's audience.
+
+---
+
+## 8. v2 kernel-launch suites — on-GPU verification record (Apple M4)
+
+The kernel path (fatbin → PTX → MSL → Metal dispatch) is verified by 14
+element-checked suites. Every suite launches real kernels on the M4 through
+the driver-API surface and compares results against CPU truth.
+
+| Suite | What it proves | Result |
+|---|---|---|
+| `v2_launch` | driver-API end-to-end; pipeline cache; buffer rebind across launches | 2×1024/1024 |
+| `v2_fatbin` | container walk: uncompressed, LZ4 (genuine match sequences), ELF-first two-entry containers | 3×1024/1024 |
+| `v2_realfat` | **real CUDA 12.4 nvcc fatbin** (624 B, flags 0x2011, LZ4-compressed PTX), generated from this repo's own vectorAdd.cu on the compute host | 1024/1024 |
+| `v2_section` | fatbin embedded in the test binary's own `__NV_CUDA,__nv_fatbin` section; shim resolves the exact extent via `getsectiondata()` — no size passed by the caller | 1024/1024 |
+| `v2_compress` | zstd (libzstd frame) and deflate compressed PTX entries | 2×1024/1024 |
+| `v2_multi` | two kernels from one module; float-scalar parameter binding via mangled-name types; cached relaunch | 3×1024/1024 |
+| `v2_loop` | grid-stride loop (backward branch + forward exit), `gridDim` builtin | 1024/1024, 512 threads × 2 iterations |
+| `v2_reduce` | tree reduction over `__shared__` (barriers, shared ld/st, halving loop): 256-int-valued floats sum to 32896 **exactly** (all partials < 2²⁴ — order-independent); `atom.global.add.u32` across 128 threads | 32896 == 32896; counter 128/128 |
+| `v2_pool` | two `__shared__` arrays in one pooled threadgroup allocation, interior addressing | out = {in[0], 2·in[31]} |
+| `v2_shfl` | ISA-exact shuffles (PTX ISA 9.7.10.6 arithmetic, clamp+segment mask): butterfly warp-sum, inclusive scan (clamp-0 `up`, `d\|p` predicate destination, `@p` adds), `selp.u64` through address math | all lanes exact |
+| `v2_simd` | `simd_shuffle` lane-0 broadcast; `selp.f32` with `0f00000000` bit-pattern immediate | 32/32 and 16/16 lanes |
+| `v2_stream` | async commit on a named stream, `cuStreamSynchronize` status-checked wait, `cudaEventElapsedTime` from GPU timestamps (0.4 ms measured) | 1024/1024 |
+| `test_run` | v0 shim contract: memory, module surface, honest `NOT_SUPPORTED` | PASS |
+| `gemm_ab` | cuBLAS→MPS regression (512³ fp32 checksum unchanged) | `27e4d0f042857a05` |
+
+**Translator honesty contract:** unsupported PTX constructs abort the
+translation with the named opcode — the shim returns `CUDA_ERROR_NOT_SUPPORTED`
+rather than ever executing a wrong translation. MSL output is additionally
+compiled through the real Metal frontend (`mslcheck`) before any GPU run is
+trusted.
+
+Residuals (definitionally closed): inactive-lane shuffle sources (undefined
+in CUDA too), ambiguous raw shared addresses in multi-var kernels (hard-fail;
+nvcc never emits them), real nvcc-zstd entries (toolchain ≥ 12.8; decoder is
+the same libzstd proven against real corpora), membermask divergence traps
+(CUDA UB).
