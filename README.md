@@ -36,6 +36,27 @@ machine-ready Metal binaries where wrappers run a driver-embedded compile
 pass, and every claim here traces to a green structured harness
 (`make test`, 22 checks) rather than a demo passing eyeball inspection.
 
+## What "bare" rules out — four structural guarantees
+
+- **No runtime API interception or hooking.** There is no vendor driver
+  being watched or patched: on a Mac no CUDA driver exists at all, so the
+  CUDA API contract is *implemented natively* (Metal / MPS underneath).
+  Where the contract is unimplemented, the shim returns
+  `CUDA_ERROR_NOT_SUPPORTED` (801) rather than guessing — the v0 contract
+  suite proves that frontier.
+- **No interpreter, no per-call bytecode translation.** Every kernel is
+  translated once, ahead of time, into a `.metallib`; launch time only
+  loads a binary and dispatches. Execution time never touches a
+  translator (measured: ~3 ms warm load vs ~1,046 ms JIT).
+- **No wrapper emulating the CUDA driver.** There is no emulation layer
+  simulating NVIDIA semantics: memory is real shared-storage Metal buffers
+  (zero-copy unified memory), streams are real command queues, events are
+  GPU timestamps.
+- **Unsupported PTX → hard-fail with the opcode named.** The translator
+  aborts with the opcode on stderr and the launch returns
+  `CUDA_ERROR_NOT_SUPPORTED` — a slow-but-wrong fallback is structurally
+  impossible, which is why the 15 suites can claim their results.
+
 The project runs a verified subset of the CUDA surface — cuBLAS GEMM (fp32),
 GEMV, AXPY, SCALE, and a complete kernel-launch path (element-wise, loops,
 tree reductions over shared memory, warp shuffles, atomics) — verified
