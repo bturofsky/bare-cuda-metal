@@ -5,23 +5,24 @@ dispatched bare-metal on Apple silicon — with the only bitwise CUDA
 verification against real NVIDIA hardware in its class.**
 
 **Bare CUDA Metal** (repo: `bare-cuda-metal`) — a CUDA compatibility layer for
-Apple-Silicon Macs. (Renamed from `cuda-metal` to stay clear of the CuMetal
-namespace.) The layer lets CUDA library calls and
+Apple-Silicon Macs. (Renamed from `cuda-metal` to a distinct family name.)
+The layer lets CUDA library calls and
 CUDA binaries run on the GPU inside your Mac (M1–M5 and newer) through Metal,
 without rewriting them — including **launching real kernels**: the PTX embedded
 in actual nvcc-produced fatbins is translated to Metal Shading Language,
 compiled **offline to `.metallib` binaries by Apple's own toolchain**, and
 dispatched bare-metal on the GPU.
 
-## Why this is not another CuMetal-class wrapper
+## Why this is not another runtime-JIT wrapper
 
-CuMetal-class projects wrap the runtime API and compile shaders at call time.
-ZLUDA-class projects intercept a live driver — and the portability scanner in
+Runtime-JIT wrapper projects compile shaders at call time and wrap the
+runtime API. Driver-interception projects (ZLUDA-class) hook a live driver —
+and the portability scanner in
 this repo *measured* why that lane is structurally limited: **PyTorch's
 1.015 GB `libtorch_cuda.so` ships zero PTX** (2,758 precompiled SASS cubins,
 8 NVIDIA generations) — there is nothing for a runtime JIT to translate.
 
-| | CuMetal-class wrapper | ZLUDA-class interceptor | **Bare CUDA Metal** |
+| | Runtime-JIT wrapper | Driver interceptor (ZLUDA-class) | **Bare CUDA Metal** |
 |---|---|---|---|
 | Kernel path | source/string → runtime JIT | PTX (when present) → runtime translate | PTX → MSL → **offline `.metallib`**, loaded in ~3 ms |
 | First-launch cost | full driver compile per process | per-process interception setup | ~3 ms binary load (one offline compile, ever, per kernel) |

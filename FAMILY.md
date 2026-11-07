@@ -49,7 +49,7 @@ unsupported — four vendor backends, one verification method.
 | M2 | Kernel path: real nvcc fatbins, PTX→MSL (control flow, shared mem, atomics, ISA-exact shuffles), async streams — 14 suites | ✅ |
 | M3 | Bare-metal AOT `.metallib`, 3 ms warm load, SIMD-aligned dispatch, blockDim-as-data, 22-check gate | ✅ |
 | M4 | Thinness ladder: AIR = sanctioned floor (below-AIR ISA is research-only, recorded) | ✅ |
-| M4.5 | CuMetal adoptions: native-Metal perf gate (measured 1.446x, <= 2.0x), GPU-provenance receipts, 10-case negative inventory (found + fixed 2 shim contract gaps: zero-grid, NULL-params) | ✅ |
+| M4.5 | Evidence discipline adopted from the competitive analysis: native-Metal perf gate (measured 1.446x, <= 2.0x), GPU-provenance receipts, 10-case negative inventory (found + fixed 2 shim contract gaps: zero-grid, NULL-params) | ✅ |
 | M5 | fp16 kernel path, multi-dim grids, dynamic shared memory | 🔜 |
 | M6 | CI for hardware-free checks | 🔜 |
 

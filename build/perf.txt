@@ -2,6 +2,6 @@ clang -O2 -Werror -framework Metal -framework Foundation -o test/perf_native tes
 clang -O2 -Wall -o perf_cuda test/perf_cuda.c shim/libcuda_shim.dylib
 PERFORMANCE GATE — translated CUDA path vs hand-written native Metal
   workload: 262,144 fp32 adds, 1024x256, GPU-clock ms, fastest of 50
-  native Metal    : 0.020917 ms
-  translated path : 0.029417 ms
-  ratio           : 1.406x  (gate: <= 2.0x) -> PASS
+  native Metal    : 0.020375 ms
+  translated path : 0.029375 ms
+  ratio           : 1.442x  (gate: <= 2.0x) -> PASS

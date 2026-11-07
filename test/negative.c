@@ -1,6 +1,6 @@
 /*
- * negative.c — the negative-test inventory (adopted from CuMetal's
- * negative-case discipline: accepting a program is not implementing it).
+ * negative.c — the negative-test inventory (the honest-error discipline:
+ * accepting a program is not the same as implementing it).
  *
  * Ten hostile inputs against the shim. Every case must produce the honest
  * error contract (specific CUDA error code, no crash, no garbage output)

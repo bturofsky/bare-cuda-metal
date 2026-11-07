@@ -1,7 +1,7 @@
 // perf_native.m — the NATIVE arm of the performance gate (family F5).
 // Hand-written MSL vectorAdd compiled directly through Apple's runtime —
 // the baseline our translated path is compared against. GPU clocks only,
-// warm-up dispatch, fastest of 50 iterations (the CuMetal-adopted gate
+// warm-up dispatch, fastest of 50 iterations (the competitive-gate
 // methodology, upgraded from wall clock to GPU timestamps).
 // Build: clang -O2 -Werror -framework Metal -framework Foundation -o perf_native perf_native.m
 #import <Metal/Metal.h>
@@ -39,7 +39,7 @@ static double gpu_ms(id<MTLCommandQueue> q, id<MTLComputePipelineState> pso,
 
 int main(void) {
   @autoreleasepool {
-    const NSUInteger N = 262144, GROUPS = 1024, THREADS = 256; /* CuMetal-gate geometry */
+    const NSUInteger N = 262144, GROUPS = 1024, THREADS = 256; /* gate geometry: 256K elements */
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     if (!dev) { printf("ERROR no device\n"); return 1; }
     NSError *err = nil;

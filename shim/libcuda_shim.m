@@ -256,7 +256,7 @@ int cuMemcpyDtoH(void *dst, CUdeviceptr src, size_t bytes) {
 
 /* ---- streams / events: real queues, async commit, GPU timestamps -------- */
 
-/* GPU-provenance receipts (CuMetal-adopted pattern): when CUDA_METAL_PROVENANCE
+/* GPU-provenance receipts (per-launch evidence artifacts): when CUDA_METAL_PROVENANCE
    is set, every completed launch appends one JSON line — device, kernel, grid
    and block shapes, GPU-clock timestamps, command-buffer status, and the AOT
    artifact path — so every result claim carries machine-checkable provenance. */

@@ -1,2 +1,2 @@
-{"device":"Apple M4","kernel":"_Z9vectorAddPKfS0_Pfi","grid":4,"block":256,"gpu_start":225522.224881,"gpu_end":225522.224885,"status":4,"artifact":"AOT metallib loaded from cache (/Users/benjaminturofsky/.cache/cuda-metal/e3349e1d00f5cb5b__Z9vectorAddPKfS0_Pfi.metallib)"}
-{"device":"Apple M4","kernel":"_Z9vectorAddPKfS0_Pfi","grid":4,"block":256,"gpu_start":225522.225678,"gpu_end":225522.225682,"status":4,"artifact":"in-process pipeline cache hit"}
+{"device":"Apple M4","kernel":"_Z9vectorAddPKfS0_Pfi","grid":4,"block":256,"gpu_start":227739.854493,"gpu_end":227739.854518,"status":4,"artifact":"AOT metallib loaded from cache (/Users/benjaminturofsky/.cache/cuda-metal/e3349e1d00f5cb5b__Z9vectorAddPKfS0_Pfi.metallib)"}
+{"device":"Apple M4","kernel":"_Z9vectorAddPKfS0_Pfi","grid":4,"block":256,"gpu_start":227739.855214,"gpu_end":227739.855217,"status":4,"artifact":"in-process pipeline cache hit"}

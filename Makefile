@@ -70,7 +70,7 @@ v3_aot: $(SHIM) test/v3_aot.c
 	$(CC) -O2 -Wall -o $@ test/v3_aot.c $(SHIM)
 	rm -rf /tmp/cuda-metal-aot-suite && ./v3_aot /tmp/cuda-metal-aot-suite && ./v3_aot /tmp/cuda-metal-aot-suite
 
-# Native-Metal performance comparison gate (family F5; CuMetal-adopted
+# Native-Metal performance comparison gate (family F5;
 # methodology, GPU clocks instead of wall clock): same workload both arms,
 # fastest of 50, gate translated <= 2.0x native.
 perf_gate: $(SHIM) test/perf_native.m test/perf_cuda.c test/perf_gate.sh

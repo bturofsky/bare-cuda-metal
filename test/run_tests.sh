@@ -94,7 +94,7 @@ hr "scanner"
 [ $? -eq 0 ] && ok "scanner runs on the real nvcc fatbin" || bad "scanner failed"
 grep -qiE "portable|entry|kernel" /tmp/scan_gate.txt && ok "scan report produced" || bad "scan report empty"
 
-hr "GPU-provenance receipts (CuMetal-adopted evidence pattern)"
+hr "GPU-provenance receipts (per-launch evidence artifacts)"
 rm -f build/prov.jsonl && mkdir -p build
 CUDA_METAL_PROVENANCE="$PWD/build/prov.jsonl" ./v2_launch >/dev/null 2>&1
 [ -s build/prov.jsonl ] && ok "receipts written per launch" || bad "no receipts"
