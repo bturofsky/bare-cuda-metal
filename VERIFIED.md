@@ -1,6 +1,6 @@
 # Test Results — CUDA↔Metal Bitwise Verification & Portability Analysis
 
-**Project:** cuda-metal · **Date:** 2026-11-04 · **All measurements taken this session, live.**
+**Project:** Bare CUDA Metal (repo `bare-cuda-metal`, formerly `cuda-metal`) · **Date:** 2026-11-04 · **All measurements taken this session, live.**
 
 Every number in this document was produced by the harness in this repository
 (`scripts/run_ab.sh`, `scan/scan`) against real hardware. Nothing is projected,
@@ -199,3 +199,53 @@ in CUDA too), ambiguous raw shared addresses in multi-var kernels (hard-fail;
 nvcc never emits them), real nvcc-zstd entries (toolchain ≥ 12.8; decoder is
 the same libzstd proven against real corpora), membermask divergence traps
 (CUDA UB).
+
+---
+
+## 9. v3 bare-metal AOT launch path — offline .metallib, zero runtime JIT
+
+The v2 path compiled translated MSL at launch with `newLibraryWithSource:`
+(a full Metal-frontend JIT, ~1 s on the first call). v3 replaces that with
+the bare-metal pipeline: the translated MSL is compiled **offline** by
+Apple's own toolchain — `metal -c -O3 -std=metal3.0` to AIR, `metallib` into
+a standalone `.metallib` binary — cached on disk under
+`~/.cache/cuda-metal` (FNV-1a64 of the MSL text), and loaded at launch with
+`newLibraryWithData:`. No source ever reaches the runtime compiler on the
+warm path. The v2 JIT remains as an automatic fallback if any AOT step
+fails (missing toolchain, compile error), and `CUDA_METAL_AOT=0` forces it.
+
+**SIMD-aligned dispatch:** Apple GPUs execute in 32-lane SIMD-groups, so the
+dispatcher now pads every threadgroup to a multiple of 32 — matching the
+idle tail of the last warp on real NVIDIA hardware. The CUDA-visible
+`blockDim` can no longer ride on Metal's `threads_per_threadgroup` builtin
+(it would report the padded width), so the translator binds it as data
+(`constant uint& _lsz_c [[buffer(30)]]`) and the shim passes the caller's
+exact block size on every launch. Padded lanes execute with `tid ≥ blockDim`
+exactly like NVIDIA tail-warp lanes; conforming kernels guard their stores,
+so semantics are preserved.
+
+### v3_aot acceptance suite (element-verified on the M4, this session)
+
+| Arm | Path | Result | Wall time of launch 1 |
+|---|---|---|---|
+| COLD (empty cache) | offline `metal -c` + `metallib`, then load | 1024/1024 exact | 813 ms (incl. toolchain) |
+| WARM (cache populated) | `newLibraryWithData:` load only — no compile anywhere | 1024/1024 exact | **3.5 ms** |
+| Pipeline cache hit (same process) | — | 1024/1024 exact | 0.18 ms |
+| Padded dispatch | 100-thread block → 128 lanes, `ntid`=100 via buffer(30) | 400/400 exact | — |
+
+Artifact gate: the suite fails unless a non-empty `.metallib` exists in the
+cache after launch 1 (measured: 4,447 bytes) — a silent JIT fallback cannot
+pass.
+
+### Regression record (all suites re-run on the new path, this session)
+
+All 14 existing suites pass unchanged: `v2_launch` (first launch now ~3 ms
+from the shared cache, was ~1,046 ms JIT), `v2_fatbin`, `v2_multi`,
+`v2_loop`, `v2_reduce` (barriers under padded dispatch), `v2_stream`,
+`v2_realfat` (real nvcc fatbin through AOT), `v2_section`, `v2_simd`,
+`v2_shfl`, `v2_pool`, `v2_compress`, `test_run` (v0 contract), and
+`gemm_ab` — cuBLAS→MPS checksum unchanged at `27e4d0f042857a05`.
+`docs/reference/vectorAdd.msl` regenerated to show the new signature.
+
+Reproduce: `make v3_aot` (runs both arms back to back: cold compile, then
+warm load).

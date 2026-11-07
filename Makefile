@@ -5,7 +5,7 @@ CC = clang
 CFLAGS = -O2 -Wall -Wextra -dynamiclib
 SHIM = shim/libcuda_shim.dylib
 
-all: $(SHIM) test_run scan/scan gemm_ab v2_launch v2_fatbin v2_multi v2_loop v2_reduce v2_stream v2_realfat v2_section v2_simd v2_shfl v2_pool v2_compress
+all: $(SHIM) test_run scan/scan gemm_ab v2_launch v2_fatbin v2_multi v2_loop v2_reduce v2_stream v2_realfat v2_section v2_simd v2_shfl v2_pool v2_compress v3_aot
 
 CUBLAS_SHIM = shim/libcublas_shim.dylib
 $(CUBLAS_SHIM): shim/libcublas_shim.m
@@ -14,8 +14,8 @@ $(CUBLAS_SHIM): shim/libcublas_shim.m
 gemm_ab: test/gemm_ab.c $(CUBLAS_SHIM) $(SHIM)
 	$(CC) -O2 -Wall -o $@ test/gemm_ab.c
 
-$(SHIM): shim/libcuda_shim.m shim/module_launch.m translator/ptx2msl.c shim/exports.txt
-	$(CC) $(CFLAGS) -I/opt/homebrew/include -framework Metal -framework Foundation -o $@ shim/libcuda_shim.m shim/module_launch.m translator/ptx2msl.c -lz -L/opt/homebrew/lib -lzstd
+$(SHIM): shim/libcuda_shim.m shim/module_launch.m shim/aot_compile.m translator/ptx2msl.c shim/exports.txt
+	$(CC) $(CFLAGS) -I/opt/homebrew/include -framework Metal -framework Foundation -o $@ shim/libcuda_shim.m shim/module_launch.m shim/aot_compile.m translator/ptx2msl.c -lz -L/opt/homebrew/lib -lzstd
 
 test/test_harness: test/test_harness.c
 	$(CC) -O2 -Wall -o $@ test/test_harness.c
@@ -56,6 +56,13 @@ v2_pool: $(SHIM) test/v2_pool.c
 v2_compress: $(SHIM) test/v2_compress.c
 	$(CC) -O2 -Wall -o $@ test/v2_compress.c $(SHIM)
 
+# Bare-metal AOT gate, both arms back to back:
+#   run 1 — cold cache: offline metal -c + metallib compile, then load
+#   run 2 — warm cache: newLibraryWithData: load only (no compile anywhere)
+v3_aot: $(SHIM) test/v3_aot.c
+	$(CC) -O2 -Wall -o $@ test/v3_aot.c $(SHIM)
+	rm -rf /tmp/cuda-metal-aot-suite && ./v3_aot /tmp/cuda-metal-aot-suite && ./v3_aot /tmp/cuda-metal-aot-suite
+
 test/nv_fatbin_section.h: docs/reference/vectorAdd.real.fatbin
 	python3 -c "import sys; d=open('docs/reference/vectorAdd.real.fatbin','rb').read(); print('#include <stddef.h>'); print('__attribute__((used, section(\"__NV_CUDA,__nv_fatbin\"))) static const unsigned char g_nv_fatbin[] = {' + ','.join(str(b) for b in d) + '};')" > $@
 
@@ -66,6 +73,6 @@ scan/scan: scan/scan.c scan/zstd_decomp.c
 	$(CC) -O2 -Wall -DHAVE_ZSTD -I/opt/homebrew/include -o $@ scan/scan.c scan/zstd_decomp.c scan/lz4_block.c -lz -L/opt/homebrew/lib -lzstd -L/opt/homebrew/opt/lz4/lib -llz4
 
 clean:
-	rm -f $(SHIM) test/test_harness v2_launch v2_fatbin v2_multi v2_loop v2_reduce v2_stream v2_realfat v2_section v2_simd v2_shfl v2_pool v2_compress test/nv_fatbin_section.h
+	rm -f $(SHIM) test/test_harness v2_launch v2_fatbin v2_multi v2_loop v2_reduce v2_stream v2_realfat v2_section v2_simd v2_shfl v2_pool v2_compress v3_aot test/nv_fatbin_section.h
 
 .PHONY: all test_run clean

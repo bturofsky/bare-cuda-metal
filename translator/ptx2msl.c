@@ -356,12 +356,18 @@ int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
            ts, kparams[i].name, i, i + 1 < nkparams ? "," : "");
     }
   }
+  /* The true CUDA blockDim arrives as data (buffer 30), not the Metal
+     builtin: the dispatcher pads the threadgroup to a multiple of 32
+     (SIMD-group alignment), and padded lanes must see the CUDA-visible
+     ntid, exactly like the idle tail of the last warp on real NVIDIA
+     hardware. */
   EMIT(",\n"
+       "  constant uint& _lsz_c [[buffer(30)]],\n"
        "  uint _gid [[threadgroup_position_in_grid]],\n"
        "  uint _lid [[thread_position_in_threadgroup]],\n"
-       "  uint _lsz [[threads_per_threadgroup]],\n"
        "  uint _ngid [[threadgroups_per_grid]]\n"
-       ") {\n");
+       ") {\n"
+       "  uint _lsz = _lsz_c;\n");
   size_t header_len = bpos;
 
   char ptr_regs[64][32];

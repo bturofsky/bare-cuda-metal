@@ -1,10 +1,13 @@
-# cuda-metal
+# Bare CUDA Metal
 
-A CUDA compatibility layer for Apple-Silicon Macs. The layer lets CUDA library calls and
+**Bare CUDA Metal** (repo: `bare-cuda-metal`) — a CUDA compatibility layer for
+Apple-Silicon Macs. (Renamed from `cuda-metal` to stay clear of the CuMetal
+namespace.) The layer lets CUDA library calls and
 CUDA binaries run on the GPU inside your Mac (M1–M5 and newer) through Metal,
 without rewriting them — including **launching real kernels**: the PTX embedded
-in actual nvcc-produced fatbins is translated to Metal Shading Language and
-dispatched on the GPU.
+in actual nvcc-produced fatbins is translated to Metal Shading Language,
+compiled **offline to `.metallib` binaries by Apple's own toolchain**, and
+dispatched bare-metal on the GPU.
 
 The project runs a verified subset of the CUDA surface — cuBLAS GEMM (fp32),
 GEMV, AXPY, SCALE, and a complete kernel-launch path (element-wise, loops,
@@ -64,8 +67,12 @@ analysis of PyTorch's 1.015 GB `libtorch_cuda.so`, and the methodology — in
   `cuLaunchKernel` on the GPU: real nvcc fatbins (LZ4/zstd/deflate-compressed
   PTX, raw PTX, Mach-O `__NV_CUDA,__nv_fatbin` sections), the PTX→MSL
   translator (arbitrary control flow, typed parameters, shared-memory pools,
-  barriers, atomics, ISA-exact warp shuffles), launch-time Metal compilation
-  with a pipeline cache (~0.3 ms cached vs ~10–100 ms cold)
+  barriers, atomics, ISA-exact warp shuffles), **AOT bare-metal compilation** —
+  `metal -c -O3 -std=metal3.0` + `metallib` produce a cached `.metallib`
+  binary loaded with `newLibraryWithData:` (first launch in a fresh process:
+  ~3 ms; zero runtime source compilation), with dispatch padded to 32-lane
+  SIMD-group multiples and the true CUDA blockDim passed as data. The v2
+  runtime JIT remains as an automatic fallback
 - **Async streams and events** — real per-stream command queues, async commit,
   `cudaStreamSynchronize` waits with status checks, `cudaEventElapsedTime`
   from GPU timestamps
@@ -86,6 +93,7 @@ analysis of PyTorch's 1.015 GB `libtorch_cuda.so`, and the methodology — in
 | `v2_shfl` | ISA-exact shuffles: butterfly warp-sum, inclusive scan (`d\|p` + `@p`), `selp.u64` |
 | `v2_simd` | `simd_shuffle` broadcast, `selp.f32` with bit-pattern immediates |
 | `v2_stream` | async commit, stream sync, event timing from GPU timestamps |
+| `v3_aot` | bare-metal AOT: offline `metal -c`+`metallib` → cached `.metallib` → `newLibraryWithData:`, warm-load arm, SIMD-aligned padded dispatch (100→128 lanes, `ntid` exact) |
 | `test_run` | v0 shim contract (memory, module, honest NOT_SUPPORTED) |
 | `gemm_ab` | cuBLAS→MPS regression (checksum unchanged) |
 
@@ -106,7 +114,9 @@ analysis of PyTorch's 1.015 GB `libtorch_cuda.so`, and the methodology — in
 CUDA application → libcuda/libcublas shim → Metal / MPS → Apple GPU
 CUDA binary → portability scanner → fatbin parse → PTX extract → opcode census
 CUDA fatbin → PTX extract (LZ4/zstd/deflate) → PTX→MSL translator
-            → Metal compile (newLibraryWithSource) → dispatch on Apple GPU
+            → AOT: metal -c -O3 + metallib → cached .metallib
+            → newLibraryWithData: (no runtime JIT) → dispatch on Apple GPU
+            (runtime newLibraryWithSource: JIT only as fallback)
 ```
 
 CUDA and MPS both store matrices column-major, so cuBLAS calls map to MPS
@@ -126,8 +136,10 @@ in 2 seconds.
   fail the translation loudly (never a wrong translation)
 - fp32 GEMM today; fp64 GEMV runs on CPU
 - Single GPU per machine; no NCCL-class collectives
-- Launch-time MSL compilation on first call (cached thereafter); bounded
-  image scan (1 MB) outside Mach-O sections
+- First-ever launch of a kernel AOT-compiles offline (~0.8 s incl. the
+  toolchain) into `~/.cache/cuda-metal`; every later process loads the
+  binary (~3 ms). JIT fallback covers machines without the Metal toolchain
+- Bounded image scan (1 MB) outside Mach-O sections
 - Built entirely on public Apple APIs
 
 ## Documentation
@@ -136,6 +148,25 @@ in 2 seconds.
 - [docs/reference/](docs/reference/) — libcuda symbol surface, real compiled
   PTX, the **real nvcc 12.4 fatbin fixture**, generated MSL, and the kernel
   acceptance inputs (loops, reductions, shuffles, containers)
+
+## Roadmap: the Bare CUDA family — next sibling: Bare CUDA ROCm
+
+The same bare-metal playbook, pointed at AMD — same architecture discipline:
+translate once, compile **AOT to native GPU binaries**, dispatch zero-copy,
+and never ship a runtime interceptor. On AMD that means HIP/ROCm instead of
+Metal:
+
+- **Path**: `hipify-clang`/`hipify-perl` for CUDA C++ source; the LLVM AMDGPU
+  backend for generated PTX-class input; `hipcc` to native code objects —
+  full LLVM compiler optimization, no ZLUDA-style interception overhead
+- **Launch hardware targets**: AMD Instinct **MI210** (CDNA2, `gfx90a`,
+  Wave64, multi-GPU RCCL over the Infinity Fabric interconnect at 552+ GB/s
+  on our 4× MI210 stack) and the workstation cards **Radeon PRO W7800 32GB**
+  (RDNA3, `gfx1101`) and **Radeon PRO W7900** (RDNA3, `gfx1100`), designed
+  around Wave32/Wave64 dual dispatch
+- **Memory**: direct HIP memory management (`hipHostMalloc`,
+  `hipMallocManaged`) so allocations land in the GPU address space natively —
+  same zero-copy discipline as the Metal layer
 
 ## Credits & license
 

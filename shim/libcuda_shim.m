@@ -1,15 +1,16 @@
 /*
- * libcuda_shim.m — v1: real Metal memory plumbing for Apple Silicon.
+ * libcuda_shim.m — v3: bare-metal AOT launch path for Apple Silicon.
  *
- * cuInit creates the system MTLDevice; cuMemAlloc returns pointers into
- * SHARED-storage MTLBuffers. On a Mac (unified memory) the CPU address and
- * the GPU address are the same bytes, so cuMemcpyHtoD/DtoH are honest
- * memcpys against buffer contents and host code can dereference the
- * returned pointer directly. Allocations are tracked in a small registry so
- * cuMemFree releases the exact MTLBuffer.
+ * Memory: cuInit creates the system MTLDevice; cuMemAlloc returns pointers
+ * into SHARED-storage MTLBuffers. On a Mac (unified memory) the CPU address
+ * and the GPU address are the same bytes — zero-copy, no staging buffers.
  *
- * Still NOT implemented (the honest frontier): module load / kernel launch
- * (phase 2: PTX→MSL). Launches return CUDA_ERROR_NOT_SUPPORTED.
+ * Launch (v3): PTX → MSL (translator) → OFFLINE compile via Apple's
+ * `metal -c -O3` + `metallib` CLIs into a cached .metallib binary → loaded
+ * at launch with newLibraryWithData: (no runtime source JIT). The v2
+ * newLibraryWithSource: JIT remains as the automatic fallback. Dispatch
+ * pads threadgroups to 32-lane SIMD-group multiples; the CUDA-visible
+ * blockDim rides as data at buffer(30) so padded lanes see the true shape.
  */
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
@@ -33,6 +34,11 @@ extern int translate_ptx_kernel(const char *ptx_text, size_t ptx_len,
                                 size_t msl_buf_sz, char *err_buf, size_t err_sz);
 extern int ptx_param_types(const char *mangled, const char *ptx_text, size_t ptx_len,
                            char *types, int max_types);
+/* aot_compile.m: bare-metal AOT path — offline metal -c/metallib + cached
+   .metallib load via newLibraryWithData:. Returns nil on any failure so the
+   caller can fall back to the runtime JIT. */
+extern id<MTLLibrary> aot_library_for_msl(id<MTLDevice> dev, const char *kernel_name,
+                                          const char *msl, char *logbuf, size_t logcap);
 
 enum {
   CUDA_SUCCESS = 0,
@@ -539,13 +545,25 @@ int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsi
       return CUDA_ERROR_NOT_SUPPORTED;
     }
 
-    NSError *err = nil;
-    id<MTLLibrary> lib = [g_device newLibraryWithSource:@(msl) options:nil error:&err];
-    if (!lib) {
-      slog("cuLaunchKernel", "MSL compile failed: %s",
-           err.localizedDescription ? err.localizedDescription.UTF8String : "?");
-      free(msl);
-      return CUDA_ERROR_NOT_SUPPORTED;
+    /* v3 bare-metal path first: offline metal -c -O3 + metallib →
+       newLibraryWithData: (no runtime source compile). The v2 JIT remains
+       the fallback whenever any AOT step fails. */
+    char aotlog[256] = "";
+    id<MTLLibrary> lib = aot_library_for_msl(g_device, kname, msl,
+                                             aotlog, sizeof aotlog);
+    if (lib) {
+      slog("cuLaunchKernel", "%s", aotlog);
+    } else {
+      if (aotlog[0]) slog("cuLaunchKernel", "AOT unavailable: %s (JIT fallback)", aotlog);
+      NSError *jerr = nil;
+      lib = [g_device newLibraryWithSource:@(msl) options:nil error:&jerr];
+      if (!lib) {
+        slog("cuLaunchKernel", "MSL compile failed: %s",
+             jerr.localizedDescription ? jerr.localizedDescription.UTF8String : "?");
+        free(msl);
+        return CUDA_ERROR_NOT_SUPPORTED;
+      }
+      slog("cuLaunchKernel", "runtime JIT compile (newLibraryWithSource)");
     }
     NSString *fname = [NSString stringWithFormat:@"%s_msl", kname];
     id<MTLFunction> fn = [lib newFunctionWithName:fname];
@@ -554,15 +572,16 @@ int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsi
       free(msl);
       return CUDA_ERROR_NOT_SUPPORTED;
     }
-    pso = [g_device newComputePipelineStateWithFunction:fn error:&err];
+    NSError *perr = nil;
+    pso = [g_device newComputePipelineStateWithFunction:fn error:&perr];
     if (!pso) {
       slog("cuLaunchKernel", "pipeline state failed: %s",
-           err.localizedDescription ? err.localizedDescription.UTF8String : "?");
+           perr.localizedDescription ? perr.localizedDescription.UTF8String : "?");
       free(msl);
       return CUDA_ERROR_NOT_SUPPORTED;
     }
     cache_pso(kname, image, pso, ptypes, nptypes);
-    slog("cuLaunchKernel", "MSL compiled and cached");
+    slog("cuLaunchKernel", "pipeline cached");
     free(msl);
   } else {
     slog("cuLaunchKernel", "pipeline cache hit");
@@ -579,7 +598,26 @@ int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsi
   }
   id<MTLCommandBuffer> cb = [q commandBuffer];
   id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+  /* 4. dispatch: CUDA grid of blocks → 1-D Metal threadgroups.
+     SIMD-group alignment: Apple GPUs execute in 32-lane SIMD-groups, so the
+     hardware threadgroup is padded to a multiple of 32 (matching the idle
+     tail of the last warp on real NVIDIA hardware). The CUDA-visible
+     blockDim travels as data (constant uint at buffer 30 — the translator
+     binds ntid there), so padded lanes compute with the caller's exact
+     block shape. */
+  NSUInteger nth = (NSUInteger)bx * by * bz;
+  if (nth == 0 || nth > pso.maxTotalThreadsPerThreadgroup) {
+    slog("cuLaunchKernel", "block %ux%ux%u exceeds device max %lu",
+         bx, by, bz, (unsigned long)pso.maxTotalThreadsPerThreadgroup);
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  uint32_t nth_true = (uint32_t)nth;
+  NSUInteger nth_pad = (nth + 31u) & ~((NSUInteger)31u);
+  if (nth_pad > (NSUInteger)pso.maxTotalThreadsPerThreadgroup) nth_pad = nth;
+  NSUInteger ng = (NSUInteger)gx * gy * gz;
   [enc setComputePipelineState:pso];
+  [enc setBytes:&nth_true length:sizeof nth_true atIndex:30];
   for (int bi = 0; params && params[bi] && bi < 16; bi++) {
     char t = bi < nptypes ? ptypes[bi] : '?';
     if (t == 'p' || t == '?') {
@@ -600,17 +638,11 @@ int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsi
       [enc setBytes:&scalar length:sizeof scalar atIndex:bi];
     }
   }
-
-  /* 4. dispatch: CUDA grid of blocks → 1-D Metal threadgroups */
-  NSUInteger nth = (NSUInteger)bx * by * bz;
-  if (nth == 0 || nth > pso.maxTotalThreadsPerThreadgroup) {
-    slog("cuLaunchKernel", "block %ux%ux%u exceeds device max %lu",
-         bx, by, bz, (unsigned long)pso.maxTotalThreadsPerThreadgroup);
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  NSUInteger ng = (NSUInteger)gx * gy * gz;
+  slog("cuLaunchKernel", "dispatch %lu threadgroups x %lu lanes (block %u, pad %lu)",
+       (unsigned long)ng, (unsigned long)nth_pad, nth_true,
+       (unsigned long)(nth_pad - nth));
   [enc dispatchThreadgroups:MTLSizeMake(ng, 1, 1)
-      threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+      threadsPerThreadgroup:MTLSizeMake(nth_pad, 1, 1)];
   [enc endEncoding];
   [cb commit];
 
