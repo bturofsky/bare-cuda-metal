@@ -2,30 +2,42 @@
 #include <metal_atomic>
 using namespace metal;
 
-static float _shfl_up(float a, uint bval, uint cval, uint lane) {
+static float _shfl_up_p(float a, uint bval, uint cval, uint lane, thread bool *p) {
   bval &= 31u; uint mask = (cval >> 8u) & 31u; uint clamp = cval & 31u;
   uint maxLane = (lane & mask) | (clamp & ~mask);
-  uint j = lane - bval; if (!(j >= maxLane)) j = lane;
-  return simd_shuffle(a, j);
+  int j = (int)lane - (int)bval; bool ok = (j >= (int)maxLane); if (!ok) j = (int)lane;
+  *p = ok; return simd_shuffle(a, (uint)j);
+}
+static float _shfl_up(float a, uint bval, uint cval, uint lane) {
+  bool p; return _shfl_up_p(a, bval, cval, lane, &p);
+}
+static float _shfl_down_p(float a, uint bval, uint cval, uint lane, thread bool *p) {
+  bval &= 31u; uint mask = (cval >> 8u) & 31u; uint clamp = cval & 31u;
+  uint maxLane = (lane & mask) | (clamp & ~mask);
+  int j = (int)lane + (int)bval; bool ok = (j <= (int)maxLane); if (!ok) j = (int)lane;
+  *p = ok; return simd_shuffle(a, (uint)j);
 }
 static float _shfl_down(float a, uint bval, uint cval, uint lane) {
+  bool p; return _shfl_down_p(a, bval, cval, lane, &p);
+}
+static float _shfl_bfly_p(float a, uint bval, uint cval, uint lane, thread bool *p) {
   bval &= 31u; uint mask = (cval >> 8u) & 31u; uint clamp = cval & 31u;
   uint maxLane = (lane & mask) | (clamp & ~mask);
-  uint j = lane + bval; if (!(j <= maxLane)) j = lane;
-  return simd_shuffle(a, j);
+  int j = (int)(lane ^ bval); bool ok = (j <= (int)maxLane); if (!ok) j = (int)lane;
+  *p = ok; return simd_shuffle(a, (uint)j);
 }
 static float _shfl_bfly(float a, uint bval, uint cval, uint lane) {
-  bval &= 31u; uint mask = (cval >> 8u) & 31u; uint clamp = cval & 31u;
-  uint maxLane = (lane & mask) | (clamp & ~mask);
-  uint j = lane ^ bval; if (!(j <= maxLane)) j = lane;
-  return simd_shuffle(a, j);
+  bool p; return _shfl_bfly_p(a, bval, cval, lane, &p);
 }
-static float _shfl_idx(float a, uint bval, uint cval, uint lane) {
+static float _shfl_idx_p(float a, uint bval, uint cval, uint lane, thread bool *p) {
   bval &= 31u; uint mask = (cval >> 8u) & 31u; uint clamp = cval & 31u;
   uint minLane = lane & mask;
   uint maxLane = (lane & mask) | (clamp & ~mask);
-  uint j = minLane | (bval & ~mask); if (!(j <= maxLane)) j = lane;
-  return simd_shuffle(a, j);
+  int j = (int)(minLane | (bval & ~mask)); bool ok = (j <= (int)maxLane); if (!ok) j = (int)lane;
+  *p = ok; return simd_shuffle(a, (uint)j);
+}
+static float _shfl_idx(float a, uint bval, uint cval, uint lane) {
+  bool p; return _shfl_idx_p(a, bval, cval, lane, &p);
 }
 kernel void _Z9vectorAddPKfS0_Pfi_msl(
   device float *param_0 [[buffer(0)]],
@@ -33,11 +45,12 @@ kernel void _Z9vectorAddPKfS0_Pfi_msl(
   device float *param_2 [[buffer(2)]],
   constant uint &param_3 [[buffer(3)]]
 ,
+  constant uint& _lsz_c [[buffer(30)]],
   uint _gid [[threadgroup_position_in_grid]],
   uint _lid [[thread_position_in_threadgroup]],
-  uint _lsz [[threads_per_threadgroup]],
   uint _ngid [[threadgroups_per_grid]]
 ) {
+  uint _lsz = _lsz_c;
   int _pc;
   device const void * rd1;
   device const void * rd2;
