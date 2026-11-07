@@ -35,7 +35,7 @@ unsupported — four vendor backends, one verification method.
 | **F1** | Hardware-free AOT lanes, four vendors, target pull-downs, per-repo gates green | ✅ |
 | **F2** | Hardware gates — real launches, element-verified on each vendor's silicon | 🔜 per-repo |
 | **F3** | Depth: scanner-ordered opcode census growth | 🔜 |
-| **F4** | Thinness ladder — per-vendor sanctioned ISA floors, engineered and measured | 🔄 (R3 shipped; A2/D2 in progress) |
+| **F4** | Thinness ladder — per-vendor sanctioned ISA floors, engineered and measured | 🟢 shipped: R3 ISA ladder measured; A2/D2 program-binary ISA cache live |
 | **F5** | Performance discipline: GPU-clock A/B vs native baselines | 🔜 |
 | **F6** | Family bridge: one CUDA workload spec → four backends → one verification record | 🔜 |
 
@@ -68,7 +68,7 @@ unsupported — four vendor backends, one verification method.
 |---|---|---|
 | A0 | Scanner, spir64 translator, validated SPIR-V ×3 profiles | ✅ |
 | A1 | A770 hardware gate: `clCreateProgramWithIL` + launch vs CPU truth; EU census; zero-copy | 🔜 needs host |
-| A2 | Program-binary ISA cache: `clGetProgramInfo(PROGRAM_BINARIES)` → cache driver-compiled Xe ISA → reload | 🔄 |
+| A2 | Program-binary ISA cache: driver-compiled binary captured + reload-verified (`tools/isa_cache.c`) | ✅ mechanism shipped |
 | A3 | Battlemage cross-check; Level Zero multi-device (Flex 170) | 🔜 |
 | A4 | Census growth: subgroup shuffles, barriers+Workgroup storage, atomics | 🔜 |
 | A5 | Below-SPIR-V honesty record: IGA exists (open) but loaders reject raw ISA — documented floor | 🔄 |
@@ -78,7 +78,7 @@ unsupported — four vendor backends, one verification method.
 |---|---|---|
 | D0 | Scanner, translator, per-target-version SPIR-V enforced by gate (830→v1.5, 750/740→v1.3) | ✅ |
 | D1 | On-device gate: adb push → launch → element-verify; strict env check | 🔜 needs device |
-| D2 | Program-binary ISA cache (Adreno driver variant) | 🔄 |
+| D2 | Program-binary ISA cache (Adreno driver variant of A2) | ✅ mechanism shipped |
 | D3 | Tile-memory census; heterogeneous SoC lane | 🔜 |
 | D4 | fp64 boundary honesty (no native fp64 — profile enforced) | ✅ |
 | D5 | Census growth; Turnip/Vulkan compute research | 🔜 |
@@ -89,8 +89,8 @@ unsupported — four vendor backends, one verification method.
 |---|---|---|---|
 | AMD | AMDGCN machine code (ours already) | hand-ISA possible but loaders accept ours | LLVM ISA pass tuning (R3), measured |
 | Apple | `.metallib`/AIR (ours) | undocumented ISA (research: appleguaisa) | none public — we are at the floor |
-| Intel | SPIR-V (ours) | IGA assembler open, but loaders reject raw ISA kernels | program-binary ISA cache (A2) |
-| Qualcomm | SPIR-V (ours) | Mesa ir3 encoders open; driver owns loading | program-binary ISA cache (D2) |
+| Intel | SPIR-V (ours) | IGA assembler open, but loaders reject raw ISA kernels | program-binary ISA cache (A2) — shipped |
+| Qualcomm | SPIR-V (ours) | Mesa ir3 encoders open; driver owns loading | program-binary ISA cache (D2) — shipped |
 
 **The wall is the load ABI, not the assembler**: kernel arguments, binding
 tables, tile/register allocation at load are driver-owned on Apple, Intel,
@@ -101,7 +101,7 @@ Intel + Qualcomm — each at its vendor's sanctioned floor.
 ## Sequencing logic
 
 F2 needs hardware (MI210/Arc hosts, one Snapdragon device). F3/F4 need only
-machines in hand — R3 shipped, A2/D2 in progress. F6 lands after at least
+machines in hand — R3, A2, D2 shipped. F6 lands after at least
 two hardware gates are live.
 
 ## Reproduce the family gates
