@@ -230,6 +230,7 @@ int cuMemFree(CUdeviceptr dptr) {
 }
 
 int cuMemHostAlloc(void **pp, size_t bytes, unsigned flags) {
+  (void)flags;
   slog("cuMemHostAlloc", "bytes=%zu", bytes);
   if (pp) *pp = malloc(bytes ? bytes : 1);
   return *pp ? CUDA_SUCCESS : CUDA_ERROR_OUT_OF_MEMORY;
@@ -391,7 +392,7 @@ static size_t resolve_image_size(const void *image, size_t fallback) {
         (const struct mach_header_64 *)_dyld_get_image_header(i);
     if (!hdr) continue;
     unsigned long size = 0;
-    char *data = getsectiondata(hdr, "__NV_CUDA", "__nv_fatbin", &size);
+    char *data = (char *)getsectiondata(hdr, "__NV_CUDA", "__nv_fatbin", &size);
     if (data && size > 0 && (const char *)image >= data &&
         (const char *)image < data + size)
       return (size_t)(data + size - (const char *)image);
@@ -481,7 +482,7 @@ int cuModuleLoadData(CUdeviceptr *module, const void *image) {
   if (module) *module = (CUdeviceptr)(mi + 1); /* handle: index+1, 0 invalid */
   return CUDA_SUCCESS;
 }
-int cuModuleUnload(CUdeviceptr module) { slog("cuModuleUnload", ""); return CUDA_SUCCESS; }
+int cuModuleUnload(CUdeviceptr module) { (void)module; slog("cuModuleUnload", ""); return CUDA_SUCCESS; }
 
 int cuModuleGetFunction(CUdeviceptr *func, CUdeviceptr module, const char *name) {
   int mi = (int)module - 1;
@@ -501,7 +502,9 @@ int cuModuleGetFunction(CUdeviceptr *func, CUdeviceptr module, const char *name)
 
 int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsigned bx,
                    unsigned by, unsigned bz, unsigned sharedMem, CUdeviceptr stream,
-                   void **params, void **extra) {
+                    void **params, void **extra) {
+  (void)sharedMem; /* per-kernel shared pool is allocated inside the translated kernel */
+  (void)extra;
   int fidx = (int)func - 1;
   if (!g_device) return CUDA_ERROR_NOT_INITIALIZED;
   if (fidx < 0 || fidx >= g_nfuncs) {

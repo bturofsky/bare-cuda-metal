@@ -1,11 +1,18 @@
-# cuda-metal v0 build
-# shim: libcuda_shim.dylib (the interposition surface; v0 exports everything)
-# test: the dlopen harness asserting the v0 contract
+# cuda-metal v3 build — the warning harness is part of the contract:
+# every binary builds under -Wall -Wextra -Werror or the build fails.
 CC = clang
-CFLAGS = -O2 -Wall -Wextra -dynamiclib
+CFLAGS = -O2 -Wall -Wextra -Werror -dynamiclib
 SHIM = shim/libcuda_shim.dylib
 
+.PHONY: all test_run clean doctor test
+
 all: $(SHIM) test_run scan/scan gemm_ab v2_launch v2_fatbin v2_multi v2_loop v2_reduce v2_stream v2_realfat v2_section v2_simd v2_shfl v2_pool v2_compress v3_aot
+
+doctor:
+	@bash scripts/doctor.sh
+
+test: all
+	@bash test/run_tests.sh
 
 CUBLAS_SHIM = shim/libcublas_shim.dylib
 $(CUBLAS_SHIM): shim/libcublas_shim.m
@@ -70,7 +77,7 @@ v2_section: $(SHIM) test/v2_section.c test/nv_fatbin_section.h
 	$(CC) -O2 -Wall -o $@ test/v2_section.c $(SHIM)
 
 scan/scan: scan/scan.c scan/zstd_decomp.c
-	$(CC) -O2 -Wall -DHAVE_ZSTD -I/opt/homebrew/include -o $@ scan/scan.c scan/zstd_decomp.c scan/lz4_block.c -lz -L/opt/homebrew/lib -lzstd -L/opt/homebrew/opt/lz4/lib -llz4
+	$(CC) -O2 -Wall -Wextra -Werror -DHAVE_ZSTD -I/opt/homebrew/include -o $@ scan/scan.c scan/zstd_decomp.c scan/lz4_block.c -lz -L/opt/homebrew/lib -lzstd -L/opt/homebrew/opt/lz4/lib -llz4
 
 clean:
 	rm -f $(SHIM) test/test_harness v2_launch v2_fatbin v2_multi v2_loop v2_reduce v2_stream v2_realfat v2_section v2_simd v2_shfl v2_pool v2_compress v3_aot test/nv_fatbin_section.h

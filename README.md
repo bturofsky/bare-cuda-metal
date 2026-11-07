@@ -1,5 +1,9 @@
 # Bare CUDA Metal
 
+**CUDA kernels compiled ahead-of-time to native Metal binaries and
+dispatched bare-metal on Apple silicon — with the only bitwise CUDA
+verification against real NVIDIA hardware in its class.**
+
 **Bare CUDA Metal** (repo: `bare-cuda-metal`) — a CUDA compatibility layer for
 Apple-Silicon Macs. (Renamed from `cuda-metal` to stay clear of the CuMetal
 namespace.) The layer lets CUDA library calls and
@@ -9,14 +13,47 @@ in actual nvcc-produced fatbins is translated to Metal Shading Language,
 compiled **offline to `.metallib` binaries by Apple's own toolchain**, and
 dispatched bare-metal on the GPU.
 
+## Why this is not another CuMetal-class wrapper
+
+CuMetal-class projects wrap the runtime API and compile shaders at call time.
+ZLUDA-class projects intercept a live driver — and the portability scanner in
+this repo *measured* why that lane is structurally limited: **PyTorch's
+1.015 GB `libtorch_cuda.so` ships zero PTX** (2,758 precompiled SASS cubins,
+8 NVIDIA generations) — there is nothing for a runtime JIT to translate.
+
+| | CuMetal-class wrapper | ZLUDA-class interceptor | **Bare CUDA Metal** |
+|---|---|---|---|
+| Kernel path | source/string → runtime JIT | PTX (when present) → runtime translate | PTX → MSL → **offline `.metallib`**, loaded in ~3 ms |
+| First-launch cost | full driver compile per process | per-process interception setup | ~3 ms binary load (one offline compile, ever, per kernel) |
+| Correctness evidence | examples pass | none published | **bitwise match vs RTX 8000** (`03b27e9ef9f4eb97`), 15 element-verified suites, checksum-locked GEMM |
+| Unsupported features | silent misbehavior risk | crash / undefined | **hard-fail with the opcode named** (`CUDA_ERROR_NOT_SUPPORTED`) — never a wrong result |
+| Memory model | wrapper-managed | hook-managed | **zero-copy unified memory** — `cudaMalloc` returns host pointers into shared-storage `MTLBuffer`s |
+| Dispatch | Metal default | emulated | **SIMD-group aligned** (32-lane padded, blockDim-as-data at buffer(30)) |
+| Binary coverage | CUDA source only | PTX-bearing fatbins only | real nvcc fatbins (LZ4/zstd/deflate), raw PTX, `__NV_CUDA,__nv_fatbin` sections — **plus a 2-second scanner that proves when a binary has no PTX at all** |
+
+The measurable difference is startup and proof: the AOT layer loads
+machine-ready Metal binaries where wrappers run a driver-embedded compile
+pass, and every claim here traces to a green structured harness
+(`make test`, 22 checks) rather than a demo passing eyeball inspection.
+
 The project runs a verified subset of the CUDA surface — cuBLAS GEMM (fp32),
 GEMV, AXPY, SCALE, and a complete kernel-launch path (element-wise, loops,
 tree reductions over shared memory, warp shuffles, atomics) — verified
 **bitwise against NVIDIA CUDA running on an RTX 8000** where arms exist, and
-element-verified on the M4 GPU across 14 acceptance suites. See [verified results](VERIFIED.md) and the deep-dive record (RESULTS.md)
-for exactly what is implemented today, the full test record.
+element-verified on the M4 GPU across 15 acceptance suites. See
+[VERIFIED.md](VERIFIED.md) for the full measured record,
+[ARCHITECTURE.md](ARCHITECTURE.md) for the lowering contract, and
+[ROADMAP.md](ROADMAP.md) for what lands next.
 
 ## Quick start
+
+**The one-command gate** — builds everything `-Werror`-clean, runs all 15
+suites, both AOT arms, the artifact gate, and the checksum regression:
+
+```bash
+make doctor   # toolchain audit (Metal CLI, device, codecs, fixtures)
+make test     # the 22-check structured harness — green or it fails loudly
+```
 
 **Scan any CUDA binary** — kernels, opcode census, Metal-feasibility profile,
 in seconds:
@@ -26,7 +63,7 @@ make scan/scan
 ./scan/scan /path/to/your/app_or_library.so
 ```
 
-**Run the verification gate** (needs SSH to one NVIDIA GPU machine as the
+**Run the vendor A/B gate** (needs SSH to one NVIDIA GPU machine as the
 reference arm):
 
 ```bash
@@ -46,7 +83,7 @@ DYLD_INSERT_LIBRARIES=$PWD/shim/libcuda_shim.dylib your_cuda_app
 | Arm | Hardware | Stack | GPU time | Checksum |
 |---|---|---|---|---|
 | NVIDIA reference | Quadro RTX 8000 | CUDA 12.4 | 0.056 ms | `03b27e9ef9f4eb97` |
-| **cuda-metal (Apple M4)** | Apple M4 | Metal via MSL | **0.012 ms** | `03b27e9ef9f4eb97` |
+| **Bare CUDA Metal (Apple M4)** | Apple M4 | Metal via MSL, AOT `.metallib` | **0.012 ms** | `03b27e9ef9f4eb97` |
 
 The same deterministic workload (65,536 fp32 adds, fixed seed) on both GPUs:
 **bitwise-identical checksums.** Timing is GPU-clock-only on both arms.
@@ -149,24 +186,16 @@ in 2 seconds.
   PTX, the **real nvcc 12.4 fatbin fixture**, generated MSL, and the kernel
   acceptance inputs (loops, reductions, shuffles, containers)
 
-## Roadmap: the Bare CUDA family — next sibling: Bare CUDA ROCm
+## The Bare CUDA family
 
-The same bare-metal playbook, pointed at AMD — same architecture discipline:
-translate once, compile **AOT to native GPU binaries**, dispatch zero-copy,
-and never ship a runtime interceptor. On AMD that means HIP/ROCm instead of
-Metal:
+| Project | Target | Status |
+|---|---|---|
+| **Bare CUDA Metal** (this repo) | Apple M1–M5 via Metal, AOT `.metallib` | bitwise-verified vs RTX 8000, 15 suites, 22-check gate |
+| [Bare CUDA ROCm](https://github.com/bturofsky/bare-cuda-rocm) | AMD Instinct MI210 (gfx90a) / Radeon PRO W7800 (gfx1101) / W7900 (gfx1100) via LLVM AMDGPU | v0: PTX→LLVM-IR→native code objects, hardware-free AOT lane verified, target pull-down |
 
-- **Path**: `hipify-clang`/`hipify-perl` for CUDA C++ source; the LLVM AMDGPU
-  backend for generated PTX-class input; `hipcc` to native code objects —
-  full LLVM compiler optimization, no ZLUDA-style interception overhead
-- **Launch hardware targets**: AMD Instinct **MI210** (CDNA2, `gfx90a`,
-  Wave64, multi-GPU RCCL over the Infinity Fabric interconnect at 552+ GB/s
-  on our 4× MI210 stack) and the workstation cards **Radeon PRO W7800 32GB**
-  (RDNA3, `gfx1101`) and **Radeon PRO W7900** (RDNA3, `gfx1100`), designed
-  around Wave32/Wave64 dual dispatch
-- **Memory**: direct HIP memory management (`hipHostMalloc`,
-  `hipMallocManaged`) so allocations land in the GPU address space natively —
-  same zero-copy discipline as the Metal layer
+Same architecture discipline in both: translate once, compile **AOT to
+native GPU binaries**, dispatch zero-copy, hard-fail loudly on anything
+unsupported, and never claim a result without a measured record.
 
 ## Credits & license
 

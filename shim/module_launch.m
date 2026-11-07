@@ -62,28 +62,7 @@ typedef struct {
   uint64_t uncompressed_payload;
 } fat_entry;
 
-/* ---- stored module state ------------------------------------------------- */
-#define MAX_MODULES 8
-#define MAX_FUNCS_PER_MODULE 16
-
-typedef struct {
-  char name[128];
-  char ptx_text[16384];
-  size_t ptx_len;
-  id<MTLFunction> mtl_func;
-} stored_func;
-
-typedef struct {
-  uint64_t handle;
-  stored_func funcs[MAX_FUNCS_PER_MODULE];
-  int nfuncs;
-} stored_module;
-
-static stored_module g_modules[MAX_MODULES];
-static int g_nmodules = 0;
-static pthread_mutex_t g_module_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* ---- nvcc LZ77 decompress --------------------------------------------------
+/* ---- nvcc LZ4 decompress ---------------------------------------------------
    nvcc compressed PTX entries use LZ4-token framing but the payload may carry
    an UNCOMPRESSED FOOTER after the compressed stream. When `expected` (the
    entry's decompressed_size) is known the loop is output-bounded: it stops
