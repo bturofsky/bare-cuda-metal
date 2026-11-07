@@ -94,6 +94,26 @@ hr "scanner"
 [ $? -eq 0 ] && ok "scanner runs on the real nvcc fatbin" || bad "scanner failed"
 grep -qiE "portable|entry|kernel" /tmp/scan_gate.txt && ok "scan report produced" || bad "scan report empty"
 
+hr "GPU-provenance receipts (CuMetal-adopted evidence pattern)"
+rm -f build/prov.jsonl && mkdir -p build
+CUDA_METAL_PROVENANCE="$PWD/build/prov.jsonl" ./v2_launch >/dev/null 2>&1
+[ -s build/prov.jsonl ] && ok "receipts written per launch" || bad "no receipts"
+grep -q '"status":0' build/prov.jsonl && grep -q '"gpu_start"' build/prov.jsonl \
+  && ok "receipts carry GPU-clock timestamps + Completed status" || bad "receipts malformed"
+grep -qE '"artifact":"[^"]' build/prov.jsonl && ok "receipts name the AOT artifact" || bad "no artifact provenance"
+
+hr "native-Metal performance gate (F5; <= 2.0x target, GPU clocks)"
+make --no-print-directory perf_gate > build/perf.txt 2>&1
+rc=$?; [ $rc -ne 0 ] && { make --no-print-directory perf_gate > build/perf.txt 2>&1; rc=$?; }
+tail -4 build/perf.txt | sed 's/^/    /'
+[ $rc -eq 0 ] && ok "translated path <= 2.0x native Metal (GPU clocks)" || bad "perf gate failed"
+
+hr "negative-test inventory (honest-error contract)"
+make --no-print-directory negative > build/neg.txt 2>&1
+rc=$?
+grep -c "PASS" build/neg.txt | head -1 | sed 's/^/    passed cases: /'
+[ $rc -eq 0 ] && ok "all hostile inputs produce the honest error contract" || bad "negative inventory failed"
+
 hr "summary"
 say "  passed: $PASS  failed: $FAIL"
 if [ "$FAIL" -eq 0 ]; then

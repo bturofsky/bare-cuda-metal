@@ -256,6 +256,35 @@ int cuMemcpyDtoH(void *dst, CUdeviceptr src, size_t bytes) {
 
 /* ---- streams / events: real queues, async commit, GPU timestamps -------- */
 
+/* GPU-provenance receipts (CuMetal-adopted pattern): when CUDA_METAL_PROVENANCE
+   is set, every completed launch appends one JSON line — device, kernel, grid
+   and block shapes, GPU-clock timestamps, command-buffer status, and the AOT
+   artifact path — so every result claim carries machine-checkable provenance. */
+static char g_prov_last[1024] = ""; /* kname|grid|block|artifact of the pending launch */
+
+static void provenance_record(id<MTLCommandBuffer> cb) {
+  const char *p = getenv("CUDA_METAL_PROVENANCE");
+  if (!p || !p[0] || !g_prov_last[0]) return;
+  char ctx[1024];
+  snprintf(ctx, sizeof ctx, "%s", g_prov_last);
+  g_prov_last[0] = 0;
+  char *fields[4] = {0};
+  int nf = 0;
+  char *tok = strtok(ctx, "|");
+  while (tok && nf < 4) { fields[nf++] = tok; tok = strtok(NULL, "|"); }
+  const char *artifact = nf >= 4 ? (strstr(fields[3], " -> ")
+                                    ? strstr(fields[3], " -> ") + 4 : fields[3]) : "";
+  FILE *f = fopen(p, "a");
+  if (!f) return;
+  fprintf(f,
+    "{\"device\":\"%s\",\"kernel\":\"%s\",\"grid\":%s,\"block\":%s,"
+    "\"gpu_start\":%.6f,\"gpu_end\":%.6f,\"status\":%ld,\"artifact\":\"%s\"}\n",
+    g_device ? g_device.name.UTF8String : "?",
+    nf > 0 ? fields[0] : "?", nf > 1 ? fields[1] : "0", nf > 2 ? fields[2] : "0",
+    cb.GPUStartTime, cb.GPUEndTime, (long)cb.status, artifact);
+  fclose(f);
+}
+
 /* Streams keep strong queue references (the old __bridge cast leaked the
    queue the moment the local went out of scope). Named streams commit
    asynchronously; cuStreamSynchronize waits on the stream's last buffer.
@@ -319,6 +348,8 @@ int cuStreamSynchronize(CUdeviceptr stream) {
       slog("cuStreamSynchronize", "stream=%llu status %ld",
            (unsigned long long)stream, (long)(*slot).status);
       rc = CUDA_ERROR_NOT_SUPPORTED;
+    } else {
+      provenance_record(*slot);
     }
     *slot = nil;
   }
@@ -373,6 +404,16 @@ float cuEventElapsedTime(CUdeviceptr start, CUdeviceptr end) {
     if (s.GPUEndTime > 0 && e.GPUStartTime > 0)
       ms = (float)((e.GPUStartTime - s.GPUEndTime) * 1000.0);
     slog("cuEventElapsedTime", "gpu ts: start_end=%f end_start=%f", s.GPUEndTime, e.GPUStartTime);
+  } else if (si >= 0 && si < MAX_EVENTS && ei >= 0 && ei < MAX_EVENTS &&
+             !g_events[si].cb && g_events[ei].cb) {
+    /* start event recorded before any pending work on its stream: the span
+       is the end event's own command buffer — pure kernel GPU time
+       (GPUEndTime - GPUStartTime), the documented GPU-clock discipline. */
+    id<MTLCommandBuffer> e = g_events[ei].cb;
+    [e waitUntilCompleted];
+    if (e.GPUEndTime > 0 && e.GPUStartTime > 0)
+      ms = (float)((e.GPUEndTime - e.GPUStartTime) * 1000.0);
+    slog("cuEventElapsedTime", "gpu-clock span of end event's command buffer");
   }
   slog("cuEventElapsedTime", "start=%llu end=%llu -> %f ms",
        (unsigned long long)start, (unsigned long long)end, ms);
@@ -522,6 +563,7 @@ int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsi
      on a miss so cached launches skip the PTX work entirely */
   char ptypes[MAX_PTYPES];
   int nptypes = 0;
+  char aotlog[256] = ""; /* AOT path taken (or JIT fallback note) for provenance */
   id<MTLComputePipelineState> pso = cached_pso(kname, image, ptypes, &nptypes);
   if (!pso) {
     size_t ptx_len = 0;
@@ -551,7 +593,7 @@ int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsi
     /* v3 bare-metal path first: offline metal -c -O3 + metallib →
        newLibraryWithData: (no runtime source compile). The v2 JIT remains
        the fallback whenever any AOT step fails. */
-    char aotlog[256] = "";
+    aotlog[0] = 0;
     id<MTLLibrary> lib = aot_library_for_msl(g_device, kname, msl,
                                              aotlog, sizeof aotlog);
     if (lib) {
@@ -594,6 +636,11 @@ int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsi
      .param list (u64 ambiguous). 'p': registry lookup → real MTLBuffer,
      else the raw 8 bytes. 'l'/'d': 8-byte scalar. 'u'/'i'/'f': exactly 4
      bytes (never reads past a 4-byte argument slot). */
+  if (!params && nptypes > 0) { /* CUDA contract: NULL params on a
+      param-taking kernel is invalid — launching unbound would be silent UB */
+    slog("cuLaunchKernel", "NULL params for kernel with %d declared params", nptypes);
+    return CUDA_ERROR_INVALID_VALUE;
+  }
   id<MTLCommandQueue> q = queue_for(stream);
   if (!q) {
     slog("cuLaunchKernel", "invalid stream %llu", (unsigned long long)stream);
@@ -619,6 +666,10 @@ int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsi
   NSUInteger nth_pad = (nth + 31u) & ~((NSUInteger)31u);
   if (nth_pad > (NSUInteger)pso.maxTotalThreadsPerThreadgroup) nth_pad = nth;
   NSUInteger ng = (NSUInteger)gx * gy * gz;
+  if (ng == 0) { /* CUDA rejects zero-size grids; Metal would treat it as a no-op */
+    slog("cuLaunchKernel", "zero grid rejected");
+    return CUDA_ERROR_INVALID_VALUE;
+  }
   [enc setComputePipelineState:pso];
   [enc setBytes:&nth_true length:sizeof nth_true atIndex:30];
   for (int bi = 0; params && params[bi] && bi < 16; bi++) {
@@ -644,6 +695,9 @@ int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsi
   slog("cuLaunchKernel", "dispatch %lu threadgroups x %lu lanes (block %u, pad %lu)",
        (unsigned long)ng, (unsigned long)nth_pad, nth_true,
        (unsigned long)(nth_pad - nth));
+  snprintf(g_prov_last, sizeof g_prov_last, "%s|%lu|%lu|%s",
+           kname, (unsigned long)ng, (unsigned long)nth_pad,
+           aotlog[0] ? aotlog : "runtime JIT");
   [enc dispatchThreadgroups:MTLSizeMake(ng, 1, 1)
       threadsPerThreadgroup:MTLSizeMake(nth_pad, 1, 1)];
   [enc endEncoding];
@@ -663,6 +717,7 @@ int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsi
     slog("cuLaunchKernel", "command buffer status %ld", (long)cb.status);
     return CUDA_ERROR_NOT_SUPPORTED;
   }
+  provenance_record(cb);
   slog("cuLaunchKernel", "DISPATCHED OK on %s", g_device.name.UTF8String);
   return CUDA_SUCCESS;
 }

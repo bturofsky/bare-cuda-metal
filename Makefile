@@ -4,7 +4,7 @@ CC = clang
 CFLAGS = -O2 -Wall -Wextra -Werror -dynamiclib
 SHIM = shim/libcuda_shim.dylib
 
-.PHONY: all test_run clean doctor test
+.PHONY: all test_run clean doctor test perf_gate negative
 
 all: $(SHIM) test_run scan/scan gemm_ab v2_launch v2_fatbin v2_multi v2_loop v2_reduce v2_stream v2_realfat v2_section v2_simd v2_shfl v2_pool v2_compress v3_aot
 
@@ -69,6 +69,19 @@ v2_compress: $(SHIM) test/v2_compress.c
 v3_aot: $(SHIM) test/v3_aot.c
 	$(CC) -O2 -Wall -o $@ test/v3_aot.c $(SHIM)
 	rm -rf /tmp/cuda-metal-aot-suite && ./v3_aot /tmp/cuda-metal-aot-suite && ./v3_aot /tmp/cuda-metal-aot-suite
+
+# Native-Metal performance comparison gate (family F5; CuMetal-adopted
+# methodology, GPU clocks instead of wall clock): same workload both arms,
+# fastest of 50, gate translated <= 2.0x native.
+perf_gate: $(SHIM) test/perf_native.m test/perf_cuda.c test/perf_gate.sh
+	clang -O2 -Werror -framework Metal -framework Foundation -o test/perf_native test/perf_native.m
+	$(CC) -O2 -Wall -o perf_cuda test/perf_cuda.c $(SHIM)
+	@bash test/perf_gate.sh
+
+# Negative-test inventory: the honest-error contract under hostile inputs.
+negative: $(SHIM) test/negative.c
+	$(CC) -O2 -Wall -o negative test/negative.c $(SHIM)
+	@./negative
 
 test/nv_fatbin_section.h: docs/reference/vectorAdd.real.fatbin
 	python3 -c "import sys; d=open('docs/reference/vectorAdd.real.fatbin','rb').read(); print('#include <stddef.h>'); print('__attribute__((used, section(\"__NV_CUDA,__nv_fatbin\"))) static const unsigned char g_nv_fatbin[] = {' + ','.join(str(b) for b in d) + '};')" > $@

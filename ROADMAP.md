@@ -36,3 +36,13 @@ The AMD sibling ([Bare CUDA ROCm](https://github.com/bturofsky/bare-cuda-rocm))
 reuses this project's verification method and scanner knowledge with a
 PTX→LLVM-IR→AMDGPU AOT lane. The long-term bridge (shared acceptance
 harness across both backends) is tracked in its ROADMAP phase 4.
+
+## M7 (roadmap): the Clang-based source compiler — adopt CuMetal's primary lane
+
+The one CuMetal capability we do NOT have: unmodified CUDA C++ source
+compilation (llama.cpp/GROMACS/AMReX-class breadth). The pipeline contract
+when built: vendored LLVM/Clang CUDA frontend (needs the NVIDIA CUDA SDK
+headers) -> PTX -> OUR EXISTING ptx2msl translator -> offline metal -c ->
+embedded .metallib + the existing shim runtime (memory/streams/events are
+already native). The only missing piece is the frontend integration — a
+multi-week dependency, staged here honestly rather than faked.

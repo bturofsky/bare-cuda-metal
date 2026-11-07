@@ -1,0 +1,13 @@
+clang -O2 -Wall -o negative test/negative.c shim/libcuda_shim.dylib
+NEGATIVE-TEST INVENTORY — the honest-error contract
+  PASS N1 garbage fatbin body -> NOT_SUPPORTED    rc=801 expected
+  PASS N2 unknown kernel -> launch NOT_SUPPORTED  deferred validation, honest launch failure
+  PASS N3 unsupported opcode -> NOT_SUPPORTED     suld named in log
+  PASS N4 invalid function handle -> INVALID_VALUE rc=1 expected
+  PASS N5 invalid stream -> INVALID_VALUE         rc=1 expected
+  PASS N6 zero grid -> INVALID_VALUE              rc=1 expected
+  PASS N7 oversized block -> INVALID_VALUE        rc=1 expected
+  PASS N8 post-hostile launch still correct       1024/1024 elements
+  PASS N9 duplicate module load stable            same handle reused
+  PASS N10 NULL params -> INVALID_VALUE           no crash, no unbound launch
+NEGATIVE INVENTORY: passed 10, failed 0
