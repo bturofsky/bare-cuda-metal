@@ -98,7 +98,7 @@ hr "GPU-provenance receipts (CuMetal-adopted evidence pattern)"
 rm -f build/prov.jsonl && mkdir -p build
 CUDA_METAL_PROVENANCE="$PWD/build/prov.jsonl" ./v2_launch >/dev/null 2>&1
 [ -s build/prov.jsonl ] && ok "receipts written per launch" || bad "no receipts"
-grep -q '"status":0' build/prov.jsonl && grep -q '"gpu_start"' build/prov.jsonl \
+grep -q '"status":4' build/prov.jsonl && grep -q '"gpu_start"' build/prov.jsonl \
   && ok "receipts carry GPU-clock timestamps + Completed status" || bad "receipts malformed"
 grep -qE '"artifact":"[^"]' build/prov.jsonl && ok "receipts name the AOT artifact" || bad "no artifact provenance"
 

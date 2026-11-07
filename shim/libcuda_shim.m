@@ -629,6 +629,7 @@ int cuLaunchKernel(CUdeviceptr func, unsigned gx, unsigned gy, unsigned gz, unsi
     slog("cuLaunchKernel", "pipeline cached");
     free(msl);
   } else {
+    snprintf(aotlog, sizeof aotlog, "in-process pipeline cache hit");
     slog("cuLaunchKernel", "pipeline cache hit");
   }
 
