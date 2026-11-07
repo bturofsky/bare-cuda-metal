@@ -192,8 +192,10 @@ in 2 seconds.
 |---|---|---|
 | **Bare CUDA Metal** (this repo) | Apple M1–M5 via Metal, AOT `.metallib` | bitwise-verified vs RTX 8000, 15 suites, 22-check gate |
 | [Bare CUDA ROCm](https://github.com/bturofsky/bare-cuda-rocm) | AMD Instinct MI210 (gfx90a) / Radeon PRO W7800 (gfx1101) / W7900 (gfx1100) via LLVM AMDGPU | v0: PTX→LLVM-IR→native code objects, hardware-free AOT lane verified, target pull-down |
+| [Bare CUDA Arc](https://github.com/bturofsky/bare-cuda-arc) | Intel Arc A770 / B580 / Flex 170 via Khronos-validated SPIR-V | v0: hardware-free SPIR-V AOT lane, 27-check gate |
+| [Bare CUDA Adreno](https://github.com/bturofsky/bare-cuda-adreno) | Qualcomm Adreno 830 / 750 / 740 via per-target-version SPIR-V (v1.5/v1.3 enforced) | v0: hardware-free SPIR-V AOT lane, 28-check gate |
 
-Same architecture discipline in both: translate once, compile **AOT to
+Same architecture discipline in all four: translate once, compile **AOT to
 native GPU binaries**, dispatch zero-copy, hard-fail loudly on anything
 unsupported, and never claim a result without a measured record.
 
